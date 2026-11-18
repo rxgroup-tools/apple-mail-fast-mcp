@@ -3,6 +3,7 @@ AppleScript-based connector for Apple Mail.
 """
 
 import logging
+import mimetypes
 import re
 import smtplib
 import subprocess
@@ -19,9 +20,12 @@ from typing import Any, cast
 from imapclient.exceptions import IMAPClientError, LoginError
 
 from .draft_builder import (
+    _html_to_text,
     build_draft_mime,
     build_forward_body,
     build_reply_body,
+    build_reply_html,
+    build_reply_plain_alternative,
     derive_reply_recipients,
     extract_attachment_payloads,
     forward_subject,
@@ -55,6 +59,8 @@ from .imap_overrides import (
     get_host_override,
     get_login_override,
     get_port_override,
+    has_override_for,
+    has_overrides,
 )
 from .imap_providers import detect_provider
 from .keychain import get_imap_password
@@ -569,6 +575,21 @@ def _anchor_from_applescript_record(
         "in_reply_to": in_reply_to_raw or None,
         "references": parse_rfc822_ids(references_raw),
     }
+
+
+def _fill_attachment_mime_types(attachments: Any) -> None:
+    """Fill a blank ``mime_type`` from the file name, in place.
+
+    Mail.app's ``MIME type`` attachment property raises on some accounts
+    (observed on IMAP accounts at yourhosting.nl). It is not essential, so the
+    AppleScript reads skip it on failure and the type is derived here instead.
+    """
+    if not isinstance(attachments, list):
+        return
+    for att in attachments:
+        if isinstance(att, dict) and not att.get("mime_type"):
+            guessed, _ = mimetypes.guess_type(str(att.get("name") or ""))
+            att["mime_type"] = guessed or "application/octet-stream"
 
 
 def _message_id_match_clause(message_id: str) -> str:
@@ -1829,7 +1850,24 @@ class AppleMailConnector:
         # (#405) An explicit host override (setup-imap --host) wins over the
         # Mail.app-reported server name. Applied *before* the #299 iCloud
         # alias logic below so that logic keys off the intended host.
-        host_override = get_host_override(account)
+        alt_cache: list[str | None] = []
+
+        def _override_for(getter: Callable[[str], Any]) -> Any:
+            """Look an override up under the caller's identifier, then under
+            the other form (account name <-> UUID). Overrides are persisted
+            under whatever string ``setup-imap`` was given (usually the name),
+            but callers often pass the UUID; without this bridge the port
+            override is missed, Mail.app's misreported port is used and IMAP
+            fails with an SSL error before falling back to AppleScript."""
+            value = getter(account)
+            if value or not has_overrides() or has_override_for(account):
+                return value
+            if not alt_cache:
+                alt_cache.append(self._alternative_account_identifier(account))
+            alt = alt_cache[0]
+            return getter(alt) if alt else value
+
+        host_override = _override_for(get_host_override)
         if host_override:
             host = host_override
         # (#299) iCloud IMAP (*.mail.me.com) authenticates the account's own
@@ -1852,14 +1890,16 @@ class AppleMailConnector:
         # derived from the account properties — e.g. an iCloud account with a
         # third-party Apple ID and an empty `email addresses` list, where the
         # #299 apple-alias rule has nothing to choose from.
-        override = get_login_override(account)
+        override = _override_for(get_login_override)
         if override:
             email = override
         # (#405) An explicit port override (setup-imap --port) wins over the
         # Mail.app-reported port — the fix for accounts whose Mail.app
         # scriptably misreports the IMAP port (e.g. a Zimbra account that
         # returns 143 for a server actually on 993/implicit-TLS).
-        port = get_port_override(account) or cast(int, parsed.get("port") or 0)
+        port = _override_for(get_port_override) or cast(
+            int, parsed.get("port") or 0
+        )
         return (host, port, email)
 
     def _imap_search(
@@ -2388,14 +2428,50 @@ class AppleMailConnector:
         )
 
         if include_attachments:
+            # Attachment metadata is best-effort: each property is read in its
+            # own try so one failing property (e.g. `file size` on a
+            # not-yet-downloaded attachment) can never abort the whole message
+            # lookup — it used to land in the surrounding per-mailbox `try`
+            # and surface as a bogus "message not found" (silent empty
+            # get_messages result). Failures set attFailed, which the caller
+            # reports as a `warnings` entry instead of hiding it.
             attachments_clause = '''
                         set attList to {}
-                        repeat with att in mail attachments of msg
-                            set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                            set end of attList to attRecord
-                        end repeat
+                        set attFailed to false
+                        try
+                            repeat with att in mail attachments of msg
+                                set attName to "attachment"
+                                set attMime to ""
+                                set attSize to 0
+                                set attDown to false
+                                try
+                                    set attName to (name of att)
+                                on error
+                                    set attFailed to true
+                                end try
+                                try
+                                    set attMime to (MIME type of att)
+                                on error
+                                    set attMime to ""
+                                end try
+                                try
+                                    set attSize to (file size of att)
+                                on error
+                                    set attFailed to true
+                                end try
+                                try
+                                    set attDown to (downloaded of att)
+                                on error
+                                    set attFailed to true
+                                end try
+                                set attRecord to {|name|:attName, |mime_type|:attMime, |size|:attSize, |downloaded|:attDown}
+                                set end of attList to attRecord
+                            end repeat
+                        on error
+                            set attFailed to true
+                        end try
 '''
-            attachments_field = ", |attachments|:attList"
+            attachments_field = ", |attachments|:attList, |attachments_incomplete|:attFailed"
         else:
             attachments_clause = ""
             attachments_field = ""
@@ -2424,7 +2500,18 @@ class AppleMailConnector:
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        return cast(dict[str, Any], parse_applescript_json(result))
+        message = cast(dict[str, Any], parse_applescript_json(result))
+        _fill_attachment_mime_types(message.get("attachments"))
+        if message.pop("attachments_incomplete", False):
+            warnings = list(message.get("warnings") or [])
+            warnings.append(
+                "Attachment metadata is incomplete: Mail could not read all "
+                "properties of one or more attachments. The body is intact; "
+                "use get_attachment_content / save_attachments to fetch the "
+                "attachments themselves."
+            )
+            message["warnings"] = warnings
+        return message
 
     def auto_template_vars(self, message_id: str | None) -> dict[str, str]:
         """Build the auto-fill variable dict for render_template.
@@ -2794,7 +2881,23 @@ class AppleMailConnector:
 
                         set resultData to {{}}
                         repeat with att in attList
-                            set attRecord to {{|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}}
+                            set attName to ""
+                            set attMime to ""
+                            set attSize to 0
+                            set attDown to false
+                            try
+                                set attName to (name of att)
+                            end try
+                            try
+                                set attMime to (MIME type of att)
+                            end try
+                            try
+                                set attSize to (file size of att)
+                            end try
+                            try
+                                set attDown to (downloaded of att)
+                            end try
+                            set attRecord to {{|name|:attName, |mime_type|:attMime, |size|:attSize, |downloaded|:attDown}}
                             set end of resultData to attRecord
                         end repeat
                         exit repeat
@@ -2811,7 +2914,9 @@ class AppleMailConnector:
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        return cast(list[dict[str, Any]], parse_applescript_json(result))
+        attachments = cast(list[dict[str, Any]], parse_applescript_json(result))
+        _fill_attachment_mime_types(attachments)
+        return attachments
 
     def get_thread(self, message_id: str) -> list[dict[str, Any]]:
         """Return all messages in the thread containing ``message_id``.
@@ -3675,6 +3780,91 @@ class AppleMailConnector:
             m.pop("references_parsed", None)
 
         return thread
+
+    def save_message(
+        self,
+        message_id: str,
+        save_directory: Path,
+        *,
+        account: str,
+        mailbox: str,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Save a whole message as an ``.eml`` file (raw RFC 822) over IMAP.
+
+        The file can be attached to a draft via ``attachment_paths`` or kept
+        as an archive copy. IMAP only: AppleScript cannot hand over the raw
+        source reliably, so an unreachable IMAP server is an error here
+        rather than a silent fallback.
+
+        Args:
+            message_id: RFC 5322 Message-ID (with or without ``<>``).
+            save_directory: Existing directory to write into.
+            account: Mail.app account name or UUID.
+            mailbox: Folder the message lives in.
+            filename: Optional base name (``.eml`` is appended when missing).
+                Defaults to the subject, then the Message-ID.
+
+        Returns:
+            ``{"path", "name", "size"}`` of the written file.
+
+        Raises:
+            FileNotFoundError / ValueError: bad ``save_directory``.
+            MailMessageNotFoundError: message not in ``mailbox``.
+            MailAttachmentTooLargeError: raw message above the total cap.
+            RuntimeError: IMAP unavailable.
+        """
+        import email as _email
+        import email.policy as _email_policy
+
+        if not save_directory.exists():
+            raise FileNotFoundError(f"Save directory does not exist: {save_directory}")
+        if not save_directory.is_dir():
+            raise ValueError(f"Save path is not a directory: {save_directory}")
+        save_directory = save_directory.resolve()
+
+        try:
+            host, port, email_addr = self._resolve_imap_config(account)
+            password = self._get_imap_password_with_fallback(account, email_addr)
+            imap = ImapConnector(
+                host, port, email_addr, password, pool=self._imap_pool
+            )
+            raw = imap.fetch_raw_message(message_id, mailbox)
+        except _IMAP_FALLBACK_EXCS as exc:
+            raise RuntimeError(
+                f"save_message needs IMAP, which is unavailable for "
+                f"{account!r}: {exc}"
+            ) from exc
+
+        if len(raw) > self.max_total_attachment_bytes:
+            raise MailAttachmentTooLargeError(
+                f"message is {len(raw)} bytes, above the "
+                f"{self.max_total_attachment_bytes}-byte cap"
+            )
+
+        base = filename
+        if not base:
+            try:
+                msg = _email.message_from_bytes(raw, policy=_email_policy.default)
+                base = str(msg.get("Subject") or "").strip()
+            except Exception:  # noqa: BLE001 - name is cosmetic
+                base = ""
+        if not base:
+            base = message_id.strip().strip("<>")
+        base = sanitize_filename(base) or "message"
+        if base.lower().endswith(".eml"):
+            base = base[:-4] or "message"
+        base = base[:120]
+
+        target = save_directory / f"{base}.eml"
+        n = 1
+        while target.exists():
+            n += 1
+            target = save_directory / f"{base}-{n}.eml"
+        if target.resolve().parent != save_directory:
+            raise ValueError("Resolved path escapes the save directory")
+        target.write_bytes(raw)
+        return {"path": str(target), "name": target.name, "size": len(raw)}
 
     def save_attachments(
         self,
@@ -5337,6 +5527,8 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        body_html: str | None = None,
+        quote_attribution: str | None = None,
     ) -> dict[str, str]:
         """Create a clean reply/forward save-as-draft via IMAP APPEND
         (issue #245 follow-up).
@@ -5372,6 +5564,8 @@ class AppleMailConnector:
             body=body,
             reply_all=reply_all,
             attachment_paths=attachment_paths,
+            body_html=body_html,
+            quote_attribution=quote_attribution,
         )
         imap.append_draft(draft_raw)
         self._imap_clear_breaker(from_account)
@@ -5451,6 +5645,9 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        body_html: str | None = None,
+        quote_attribution: str | None = None,
+        mark_as_draft: bool = True,
     ) -> tuple[str, bytes, list[str]]:
         """Fetch the original over IMAP, rebuild a clean (no cite-blockquote)
         reply/forward MIME with threading headers, and return
@@ -5494,6 +5691,28 @@ class AppleMailConnector:
             reply_all=reply_all,
         )
 
+        final_html: str | None = None
+        if body_html is not None and seed == "reply":
+            # HTML reply: the caller's HTML goes above a cite-type blockquote
+            # holding the original (its HTML part when it has one), with a
+            # matching text/plain alternative. Threading headers are the same
+            # as for the plain path.
+            final_html = build_reply_html(
+                new_html=body_html,
+                original_from=orig.from_header,
+                original_date=orig.date,
+                original_html=orig.html,
+                original_text=orig.text,
+                attribution=quote_attribution,
+            )
+            final_body = build_reply_plain_alternative(
+                new_body=body if body else _html_to_text(body_html),
+                original_from=orig.from_header,
+                original_date=orig.date,
+                original_text=orig.text,
+                attribution=quote_attribution,
+            )
+
         message_id, draft_raw = build_draft_mime(
             sender=sender,
             to=final_to,
@@ -5501,12 +5720,14 @@ class AppleMailConnector:
             bcc=bcc,
             subject=final_subject or "",
             body=final_body,
+            body_html=final_html,
             attachments=(
                 [Path(p) for p in attachment_paths] if attachment_paths else None
             ),
             in_reply_to=in_reply_to,
             references=references or None,
             forwarded_attachments=forwarded_attachments,
+            mark_as_draft=mark_as_draft,
         )
         recipients = list(final_to) + list(final_cc or []) + list(bcc or [])
         return message_id, draft_raw, recipients
@@ -5571,6 +5792,8 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        body_html: str | None = None,
+        quote_attribution: str | None = None,
     ) -> dict[str, str] | None:
         """IMAP-APPEND path for a reply/forward save-as-draft (issue #245
         follow-up).
@@ -5605,6 +5828,8 @@ class AppleMailConnector:
                 body=body,
                 reply_all=reply_all,
                 attachment_paths=attachment_paths,
+                body_html=body_html,
+                quote_attribution=quote_attribution,
             )
         except _IMAP_FALLBACK_EXCS as exc:
             self._log_imap_fallback(from_account, exc)
@@ -5728,6 +5953,7 @@ class AppleMailConnector:
         body: str,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
+        body_html: str | None = None,
     ) -> dict[str, str]:
         """Build a clean fresh-compose RFC 822 message and SMTP-send it
         (issue #322 — the ``seed="new"`` send analog of the #246 draft path).
@@ -5740,9 +5966,11 @@ class AppleMailConnector:
             bcc=bcc,
             subject=subject,
             body=body,
+            body_html=body_html,
             attachments=(
                 [Path(p) for p in attachment_paths] if attachment_paths else None
             ),
+            mark_as_draft=False,
         )
         recipients = list(to) + list(cc or []) + list(bcc or [])
         self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
@@ -5767,6 +5995,8 @@ class AppleMailConnector:
         reply_all: bool,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
+        body_html: str | None = None,
+        quote_attribution: str | None = None,
     ) -> dict[str, str]:
         """Rebuild a clean reply/forward from the original (fetched over IMAP)
         and SMTP-send it (issue #322 — the send analog of the #292 draft
@@ -5790,6 +6020,9 @@ class AppleMailConnector:
             body=body,
             reply_all=reply_all,
             attachment_paths=attachment_paths,
+            body_html=body_html,
+            quote_attribution=quote_attribution,
+            mark_as_draft=False,
         )
         self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
@@ -5905,6 +6138,7 @@ class AppleMailConnector:
         body_html: str | None,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        quote_attribution: str | None = None,
     ) -> dict[str, str] | None:
         """Try the clean, wrapper-free paths in order and return the first
         that engages, or ``None`` to fall through to AppleScript.
@@ -5931,6 +6165,7 @@ class AppleMailConnector:
             body_html=body_html,
             reply_all=reply_all,
             attachment_paths=attachment_paths,
+            quote_attribution=quote_attribution,
         )
         if imap_result is not None:
             imap_result.setdefault("from_account", effective_account or "")
@@ -5953,6 +6188,8 @@ class AppleMailConnector:
             body=body,
             reply_all=reply_all,
             attachment_paths=attachment_paths,
+            body_html=body_html,
+            quote_attribution=quote_attribution,
         )
         if smtp_result is not None:
             smtp_result.setdefault("from_account", effective_account or "")
@@ -5974,6 +6211,8 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        body_html: str | None = None,
+        quote_attribution: str | None = None,
     ) -> dict[str, str] | None:
         """Clean SMTP send path for ``send_now=True`` (issue #322).
 
@@ -6018,6 +6257,7 @@ class AppleMailConnector:
                     body=body,
                     attachment_paths=attachment_paths,
                     smtp_config=smtp_config,
+                    body_html=body_html,
                 )
             return self._send_reply_forward_via_smtp(
                 seed=seed,
@@ -6032,6 +6272,8 @@ class AppleMailConnector:
                 reply_all=reply_all,
                 attachment_paths=attachment_paths,
                 smtp_config=smtp_config,
+                body_html=body_html,
+                quote_attribution=quote_attribution,
             )
         except _SMTP_FALLBACK_EXCS as exc:
             self._log_imap_fallback(from_account, exc)
@@ -6058,6 +6300,7 @@ class AppleMailConnector:
         from_account: str | None = None,
         send_now: bool = False,
         on_warning: Callable[[str], None] | None = None,
+        quote_attribution: str | None = None,
     ) -> dict[str, str]:
         """Create a draft (fresh, reply, or forward). Optionally send.
 
@@ -6122,6 +6365,9 @@ class AppleMailConnector:
                 that account is adopted so the clean IMAP path can engage
                 (it is Mail's default sender anyway, so the From is
                 unchanged). (#321)
+            quote_attribution: HTML replies only (``seed="reply"`` with
+                ``body_html``): override the attribution line above the
+                quoted original (default ``On <date>, <from> wrote:``).
             on_warning: Optional callback invoked with a human-readable
                 string when a save-as-draft falls back to the AppleScript
                 path (whose body carries Mail.app's cite-blockquote wrapper,
@@ -6167,6 +6413,7 @@ class AppleMailConnector:
             body_html=body_html,
             reply_all=reply_all,
             attachment_paths=attachment_paths,
+            quote_attribution=quote_attribution,
         )
         if clean_result is not None:
             return clean_result
@@ -6176,6 +6423,14 @@ class AppleMailConnector:
         # couldn't engage, fail loud rather than silently dropping the HTML
         # into a plain-text AppleScript draft. (#251)
         if body_html is not None:
+            if send_now:
+                raise MailDraftHtmlUnavailableError(
+                    "Sending an HTML message needs SMTP and Keychain access "
+                    "and an explicit from_account"
+                    + (f" (account {effective_account!r})" if effective_account else "")
+                    + ". Nothing was sent. Save it as a draft instead "
+                    "(send_now=false) or omit body_html for a plain-text send."
+                )
             raise MailDraftHtmlUnavailableError(
                 "HTML drafts require IMAP credentials"
                 + (f" for account {effective_account!r}" if effective_account else "")
@@ -6505,13 +6760,15 @@ class AppleMailConnector:
         reply_all: bool,
         attachment_paths: list[Path] | None,
         body_html: str | None = None,
+        quote_attribution: str | None = None,
     ) -> dict[str, str] | None:
         """Try the clean IMAP-APPEND draft paths (compose, then
         reply/forward), returning a draft dict or ``None`` to fall through
         to AppleScript. (#245)
 
-        ``body_html`` is honored only on the compose (``seed="new"``) path;
-        reply/forward HTML is out of scope for #251.
+        ``body_html`` is honored on the compose (``seed="new"``) path (#251)
+        and on ``seed="reply"``, where it becomes an HTML reply with a
+        cite-blockquote of the original. HTML forwards are not supported.
         """
         result = self._try_imap_compose_draft(
             seed=seed,
@@ -6540,6 +6797,8 @@ class AppleMailConnector:
             body=body,
             reply_all=reply_all,
             attachment_paths=attachment_paths,
+            body_html=body_html,
+            quote_attribution=quote_attribution,
         )
 
     def _resolve_implicit_account(self) -> str | None:

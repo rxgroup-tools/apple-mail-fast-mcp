@@ -57,6 +57,19 @@ def _load() -> dict[str, str]:
     }
 
 
+def has_overrides() -> bool:
+    """True when any login/host/port override is persisted. Lets callers skip
+    the (AppleScript-backed) name<->UUID resolution when there is nothing to
+    look up."""
+    return bool(_load() or _load_server())
+
+
+def has_override_for(account: str) -> bool:
+    """True when ``account`` is itself a key in the login or server overrides
+    (so no name<->UUID bridging is needed to find its overrides)."""
+    return account in _load() or account in _load_server()
+
+
 def get_login_override(account: str) -> str | None:
     """Return the persisted IMAP login email for ``account``, or ``None``.
 

@@ -286,6 +286,44 @@ def _reject_control_chars(value: str, field: str) -> None:
             )
 
 
+_PREFIX_HINT_RE = re.compile(r"prefixed with:?\s*([^\s)]+)", re.IGNORECASE)
+_MISSING_FOLDER_MARKERS = (
+    "namespace", "nonexistent", "does not exist", "no such", "unknown mailbox",
+)
+
+
+def _select_folder(client: Any, mailbox: str, *, readonly: bool) -> Any:
+    """``select_folder`` that copes with servers using a personal namespace.
+
+    Dovecot-style servers (e.g. yourhosting.nl) expose every folder below
+    ``INBOX.``; Mail.app and callers use the bare name (``Drafts``) and the
+    plain SELECT fails with "Client tried to access nonexistent namespace
+    (Mailbox name should probably be prefixed with: INBOX.)". On such a
+    failure retry once with the prefix the server names (or ``INBOX.`` /
+    ``INBOX/``). Any other error, and INBOX itself, propagate unchanged.
+    """
+    try:
+        return client.select_folder(mailbox, readonly=readonly)
+    except IMAPClientError as exc:
+        text = str(exc)
+        lowered = text.lower()
+        if mailbox.upper().startswith("INBOX") or not any(
+            marker in lowered for marker in _MISSING_FOLDER_MARKERS
+        ):
+            raise
+        candidates: list[str] = []
+        hint = _PREFIX_HINT_RE.search(text)
+        if hint:
+            candidates.append(hint.group(1) + mailbox)
+        candidates += [f"INBOX.{mailbox}", f"INBOX/{mailbox}"]
+        for candidate in dict.fromkeys(candidates):
+            try:
+                return client.select_folder(candidate, readonly=readonly)
+            except IMAPClientError:
+                continue
+        raise
+
+
 def _bracket_message_id(message_id: str) -> str:
     """Validate a Message-ID and return it in RFC 5322 bracketed form.
 
@@ -294,6 +332,9 @@ def _bracket_message_id(message_id: str) -> str:
     for every ``SEARCH HEADER "Message-ID" "<id>"`` construction so no call
     site can build a bracketed id without the CRLF-injection guard.
     """
+    # Tolerate ids copied from older output that carry surrounding
+    # whitespace; control characters INSIDE the id are still rejected below.
+    message_id = message_id.strip()
     _reject_control_chars(message_id, "message_id")
     if message_id.startswith("<") and message_id.endswith(">"):
         return message_id
@@ -517,6 +558,11 @@ def _decode_mime_header(raw: bytes | bytearray | str | None) -> str:
 
 
 def _strip_brackets(s: str) -> str:
+    # A folded header ("Message-ID:\r\n <abc@host>") reaches us with leading
+    # whitespace (space or tab); without stripping it first the brackets are
+    # not recognised and the id comes back as " <abc@host>", which then breaks
+    # every follow-up lookup (control-char guard / failed SEARCH).
+    s = s.strip()
     if s.startswith("<") and s.endswith(">"):
         return s[1:-1]
     return s
@@ -987,7 +1033,7 @@ class ImapConnector:
         charset = _search_charset(criteria)
 
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
+            _select_folder(client, mailbox, readonly=True)
 
             # Pass charset only when a non-ASCII term needs it — keeps ASCII
             # searches on the default us-ascii path (max server compatibility)
@@ -1165,7 +1211,7 @@ class ImapConnector:
             fetch_keys.append(b"BODYSTRUCTURE")
 
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
+            _select_folder(client, mailbox, readonly=True)
 
             uids = client.search(["HEADER", "Message-ID", bracketed])
             if not uids:
@@ -1216,7 +1262,7 @@ class ImapConnector:
         bracketed = _bracket_message_id(message_id)
         _reject_control_chars(mailbox, "mailbox")
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
+            _select_folder(client, mailbox, readonly=True)
             uids = client.search(["HEADER", "Message-ID", bracketed])
             if not uids:
                 raise MailMessageNotFoundError(
@@ -1275,7 +1321,7 @@ class ImapConnector:
         _reject_control_chars(mailbox, "mailbox")
 
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
+            _select_folder(client, mailbox, readonly=True)
 
             uids = client.search(["HEADER", "Message-ID", bracketed])
             if not uids:
@@ -1630,7 +1676,7 @@ class ImapConnector:
         _reject_control_chars(destination_mailbox, "destination_mailbox")
 
         with self._session() as client:
-            client.select_folder(source_mailbox, readonly=False)
+            _select_folder(client, source_mailbox, readonly=False)
 
             has_move = self._has_capability(client, b"MOVE")
             has_uidplus = self._has_capability(client, b"UIDPLUS")
@@ -1868,7 +1914,7 @@ class ImapConnector:
                     f"present in the folder listing"
                 )
 
-            client.select_folder(source_mailbox, readonly=False)
+            _select_folder(client, source_mailbox, readonly=False)
 
             uids = self._resolve_uids_batch(client, message_ids)
             if not uids:
@@ -1916,7 +1962,7 @@ class ImapConnector:
         _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
-            client.select_folder(source_mailbox, readonly=False)
+            _select_folder(client, source_mailbox, readonly=False)
 
             uids = self._resolve_uids_batch(client, message_ids)
             if not uids:
@@ -1970,7 +2016,7 @@ class ImapConnector:
         _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
-            client.select_folder(source_mailbox, readonly=False)
+            _select_folder(client, source_mailbox, readonly=False)
 
             uids = self._resolve_uids_batch(client, message_ids)
             if not uids:

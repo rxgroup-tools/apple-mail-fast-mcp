@@ -127,6 +127,7 @@ OPERATION_TIERS: dict[str, str] = {
     "get_messages": "cheap_reads",
     "get_thread": "cheap_reads",
     "save_attachments": "cheap_reads",
+    "save_message": "cheap_reads",
     "get_attachment_content": "cheap_reads",
     "search_messages": "expensive_ops",
     # get_statistics (#378) composes one search_messages pass — same tier.

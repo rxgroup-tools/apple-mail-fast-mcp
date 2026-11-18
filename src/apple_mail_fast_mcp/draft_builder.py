@@ -13,6 +13,7 @@ shape is unit-testable in isolation.
 from __future__ import annotations
 
 import email
+import html as html_lib
 import mimetypes
 import re
 from dataclasses import dataclass, field
@@ -84,6 +85,7 @@ def build_draft_mime(
     in_reply_to: str | None = None,
     references: list[str] | None = None,
     forwarded_attachments: list[ForwardedAttachment] | None = None,
+    mark_as_draft: bool = True,
 ) -> tuple[str, bytes]:
     """Build a draft message (plain-text, or multipart/alternative for HTML).
 
@@ -125,6 +127,13 @@ def build_draft_mime(
         msg["Bcc"] = ", ".join(_sanitize_header(a) for a in bcc)
     msg["Subject"] = _sanitize_header(subject)
     msg["Date"] = formatdate(localtime=True)
+    # Mark the message as a Mail.app draft so Mail adopts it as its own draft
+    # and discards it from Drafts after the user sends it.
+    # Not for messages that are sent over SMTP: a sent message carrying the
+    # draft marker could end up flagged as a draft in Sent.
+    if mark_as_draft:
+        msg["X-Uniform-Type-Identifier"] = "com.apple.mail-draft"
+        msg["X-Mail-Created-Date"] = msg["Date"]
     if in_reply_to:
         msg["In-Reply-To"] = _sanitize_header(in_reply_to)
     if references:
@@ -278,6 +287,7 @@ class OriginalMessage:
     date: str = ""
     references: list[str] = field(default_factory=list)
     text: str = ""
+    html: str = ""
     attachments: list[ForwardedAttachment] = field(default_factory=list)
 
 
@@ -377,13 +387,15 @@ def parse_original_message(raw: bytes) -> OriginalMessage:
     msg = email.message_from_bytes(raw, policy=_default_policy)
 
     text = ""
+    original_html = ""
+    html_part = msg.get_body(preferencelist=("html",))
+    if html_part is not None:
+        original_html = html_part.get_content()
     plain = msg.get_body(preferencelist=("plain",))
     if plain is not None:
         text = plain.get_content()
-    else:
-        html = msg.get_body(preferencelist=("html",))
-        if html is not None:
-            text = _html_to_text(html.get_content())
+    elif original_html:
+        text = _html_to_text(original_html)
 
     # NOTE: the reply/forward path keeps stdlib iter_attachments semantics
     # (carry only non-inline attachments into the new draft). The byte-fetch
@@ -414,8 +426,88 @@ def parse_original_message(raw: bytes) -> OriginalMessage:
         date=str(msg.get("Date", "") or ""),
         references=references,
         text=text,
+        html=original_html,
         attachments=attachments,
     )
+
+
+# Quote styling mirrors how Mail.app renders a native reply: a cite-type
+# blockquote with a left rule, in Mail's quote colour. Deeper nesting levels
+# inherit the border from the nested blockquote but not the colour.
+_QUOTE_COLOR = "#6f4fd8"
+_QUOTE_ATTRIBUTION_STYLE = f"color: {_QUOTE_COLOR};"
+_QUOTE_BLOCK_STYLE = (
+    "margin: 0 0 0 0.8ex; "
+    f"border-left: 2px solid {_QUOTE_COLOR}; "
+    f"padding-left: 1ex; color: {_QUOTE_COLOR};"
+)
+
+_HTML_STRIP_BLOCKS = re.compile(
+    r"(?is)<(script|style|head|title)\b.*?</\1\s*>|<!doctype[^>]*>|<!--.*?-->"
+)
+_HTML_WRAPPER_TAGS = re.compile(r"(?i)</?(?:html|body)\b[^>]*>")
+
+
+def _original_html_fragment(original_html: str, original_text: str) -> str:
+    """Return the original message body as an embeddable HTML fragment.
+
+    Uses the original's ``text/html`` part when it has one (minus the
+    document wrapper, ``<head>``, scripts and styles, so it can sit inside a
+    blockquote); otherwise HTML-escapes the plain text and keeps its line
+    breaks. Remote-content and ``cid:`` images are left as they are.
+    """
+    if original_html and original_html.strip():
+        fragment = _HTML_STRIP_BLOCKS.sub("", original_html)
+        fragment = _HTML_WRAPPER_TAGS.sub("", fragment)
+        return fragment.strip()
+    return html_lib.escape(original_text or "").replace("\n", "<br>\n")
+
+
+def default_quote_attribution(original_from: str, original_date: str) -> str:
+    """The plain attribution line (``On <date>, <from> wrote:``)."""
+    return f"On {original_date.strip()}, {original_from.strip()} wrote:"
+
+
+def build_reply_html(
+    *,
+    new_html: str,
+    original_from: str,
+    original_date: str,
+    original_html: str,
+    original_text: str,
+    attribution: str | None = None,
+) -> str:
+    """Compose an HTML reply body: the caller's HTML, a blank line, an
+    attribution line, then the original in a ``<blockquote type="cite">``.
+
+    ``attribution`` overrides the default English line, e.g. a Dutch
+    ``"Op <datum> heeft <naam> <adres> het volgende geschreven:"``; it is
+    HTML-escaped. ``new_html`` is caller-trusted (as ``body_html`` is
+    elsewhere); the original's HTML is stripped of its document wrapper,
+    scripts and styles but is otherwise embedded as received.
+    """
+    line = attribution or default_quote_attribution(original_from, original_date)
+    fragment = _original_html_fragment(original_html, original_text)
+    return (
+        f"{new_html}"
+        "<br>"
+        f'<div style="{_QUOTE_ATTRIBUTION_STYLE}">{html_lib.escape(line)}</div>'
+        f'<blockquote type="cite" style="{_QUOTE_BLOCK_STYLE}">{fragment}</blockquote>'
+    )
+
+
+def build_reply_plain_alternative(
+    *,
+    new_body: str,
+    original_from: str,
+    original_date: str,
+    original_text: str,
+    attribution: str | None = None,
+) -> str:
+    """The ``text/plain`` alternative for an HTML reply: the caller's plain
+    body, then the attribution and the ``> ``-quoted original."""
+    line = attribution or default_quote_attribution(original_from, original_date)
+    return f"{new_body.rstrip()}\n\n{line}\n{_quote_lines(original_text)}\n"
 
 
 def build_forward_body(

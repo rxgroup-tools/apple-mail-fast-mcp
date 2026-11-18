@@ -792,13 +792,16 @@ def _resolve_id_list_to_messages(
     headers_only: bool = False,
     include_attachments: bool = False,
     body_format: str = "text",
+    missing: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve a mixed list of ids and ``SELECTED`` tokens to message dicts.
 
     ``SELECTED`` tokens expand inline to Mail.app's current UI selection
     (zero-or-more messages). Real ids are looked up via
-    ``mail.get_message()``. Missing ids drop out silently
-    (partial-results convention). The connector ``get_selected_messages``
+    ``mail.get_message()``. Missing ids drop out of the result
+    (partial-results convention) but are never silent when the caller passes
+    a ``missing`` list: every unresolved id is appended to it (and logged) so
+    ``get_messages`` can report it. The connector ``get_selected_messages``
     is called at most once even if ``SELECTED`` appears multiple times.
 
     Used by both ``search_messages.source`` (metadata mode,
@@ -809,6 +812,10 @@ def _resolve_id_list_to_messages(
     selected_resolved: list[dict[str, Any]] | None = None
     out: list[dict[str, Any]] = []
     for id_or_token in ids:
+        # Ids returned by older reads can carry surrounding whitespace; a bad
+        # one must not poison the whole batch (the IMAP layer rejects control
+        # characters such as a leading tab).
+        id_or_token = id_or_token.strip()
         if id_or_token == _SELECTED_SENTINEL:
             if selected_resolved is None:
                 selected_resolved = mail.get_selected_messages(
@@ -828,8 +835,13 @@ def _resolve_id_list_to_messages(
                     body_format=body_format,
                 )
                 out.append(msg)
-            except MailMessageNotFoundError:
-                # Partial-results: missing ids drop out silently.
+            except MailMessageNotFoundError as exc:
+                # Partial-results: the id drops out of `messages`, but the
+                # caller is told (see get_messages) — an unresolvable id must
+                # never look the same as an empty mail.
+                logger.warning("Message %r not resolved: %s", id_or_token, exc)
+                if missing is not None:
+                    missing.append(id_or_token)
                 continue
     return _annotate_injection(_bound_message_bodies(out))
 
@@ -1289,6 +1301,7 @@ def get_messages(
 
         logger.info(f"Getting messages: {len(message_ids)} ids")
 
+        missing_ids: list[str] = []
         messages = _resolve_id_list_to_messages(
             message_ids,
             include_content=include_content,
@@ -1297,7 +1310,33 @@ def get_messages(
             headers_only=headers_only,
             include_attachments=include_attachments,
             body_format=body_format,
+            missing=missing_ids,
         )
+
+        # Never fail silently: when none of the requested ids could be
+        # fetched, that is an error, not an empty mailbox.
+        if missing_ids and not messages:
+            operation_logger.log_operation(
+                "get_messages",
+                {"count": len(message_ids), "missing": len(missing_ids)},
+                "error",
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"Could not fetch {len(missing_ids)} of "
+                    f"{len(message_ids)} requested message(s). This does NOT "
+                    "mean the message is empty: the fetch failed or the id "
+                    "did not resolve."
+                ),
+                "error_type": "message_not_found",
+                "missing_ids": missing_ids,
+                "hint": (
+                    "Retry with include_attachments=false; pass the numeric "
+                    "id together with account and mailbox; or fetch "
+                    "attachments separately with get_attachment_content."
+                ),
+            }
 
         operation_logger.log_operation(
             "get_messages",
@@ -1305,11 +1344,19 @@ def get_messages(
             "success"
         )
 
-        return {
+        response: dict[str, Any] = {
             "success": True,
             "messages": messages,
             "count": len(messages),
         }
+        if missing_ids:
+            response["missing_ids"] = missing_ids
+            response["warnings"] = [
+                f"{len(missing_ids)} of {len(message_ids)} requested "
+                "message(s) could not be fetched and are not in `messages`; "
+                "this is a fetch failure, not an empty mail."
+            ]
+        return response
 
     except Exception as e:
         logger.error(f"Error getting messages: {e}")
@@ -1375,6 +1422,10 @@ def update_message(
 
     Returns:
         Dictionary with `updated` (int count) and `requested` (input count).
+        When nothing was updated the call fails with
+        ``error_type: "message_not_found"`` (never a silent success); when only
+        some were, ``success`` stays true and ``warnings`` says so. Pass
+        ``account`` and ``source_mailbox`` for a fast, reliable lookup.
 
     Example:
         >>> # Mark read + move to Archive in one call:
@@ -1431,6 +1482,9 @@ def update_message(
                 "error_type": "validation_error",
             }
 
+        # Ids from folded headers can carry stray whitespace.
+        message_ids = [m.strip() for m in message_ids]
+
         logger.info(
             f"Updating {len(message_ids)} messages "
             f"(read={read_status}, flagged={flagged}, color={flag_color}, "
@@ -1460,11 +1514,37 @@ def update_message(
             "success",
         )
 
-        return {
+        requested = len(message_ids)
+        hint = (
+            "Search the message again (ids can change) and pass the fresh id "
+            "together with account (name or UUID) and source_mailbox, e.g. "
+            "'INBOX'; without them the lookup runs through Mail.app "
+            "(AppleScript) and often fails."
+        )
+        if requested and count == 0:
+            # Nothing was updated: never report that as a success.
+            return {
+                "success": False,
+                "error": (
+                    f"None of the {requested} message(s) could be updated "
+                    "(not found)."
+                ),
+                "error_type": "message_not_found",
+                "updated": 0,
+                "requested": requested,
+                "hint": hint,
+            }
+        response: dict[str, Any] = {
             "success": True,
             "updated": count,
-            "requested": len(message_ids),
+            "requested": requested,
         }
+        if count < requested:
+            response["warnings"] = [
+                f"Only {count} of {requested} message(s) were updated; the "
+                f"rest could not be found. {hint}"
+            ]
+        return response
 
     except MailAccountNotFoundError as e:
         logger.error(f"Account not found: {e}")
@@ -1712,6 +1792,79 @@ def get_statistics(
             "error": str(e),
             "error_type": "unknown",
         }
+
+
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    mutating=True,
+)
+def save_message(
+    message_id: str,
+    save_directory: str,
+    account: str,
+    mailbox: str,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    """
+    Save a whole message as an ``.eml`` file (raw RFC 822 source).
+
+    Use it to keep a copy of a mail, or to attach a complete mail to a new
+    draft: pass the returned ``path`` in ``attachment_paths`` of
+    ``create_draft`` / ``update_draft``. Works over IMAP only.
+
+    Args:
+        message_id: RFC 5322 Message-ID from search results.
+        save_directory: Existing directory to write into (``~`` allowed).
+        account: Mail.app account name or UUID.
+        mailbox: Folder the message lives in (e.g. "INBOX").
+        filename: Optional file name; defaults to the subject. An existing
+            file is never overwritten (``-2``, ``-3`` is appended).
+
+    Returns:
+        Dict with ``success``, ``path``, ``name`` and ``size``.
+
+    Example:
+        >>> save_message("abc@host", "~/Downloads", "iCloud", "INBOX")
+        {"success": True, "path": "/Users/me/Downloads/Offerte.eml",
+         "name": "Offerte.eml", "size": 48213}
+    """
+    from pathlib import Path
+
+    try:
+        rate_err = check_rate_limit("save_message", {"message_id": message_id})
+        if rate_err:
+            return rate_err
+
+        save_path = Path(save_directory).expanduser()
+        result = mail.save_message(
+            message_id=message_id.strip(),
+            save_directory=save_path,
+            account=account,
+            mailbox=mailbox,
+            filename=filename,
+        )
+        operation_logger.log_operation(
+            "save_message",
+            {"message_id": message_id, "directory": str(save_path)},
+            "success",
+        )
+        return {"success": True, **result}
+
+    except (FileNotFoundError, ValueError) as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+    except MailMessageNotFoundError:
+        return {
+            "success": False,
+            "error": f"Message '{message_id}' not found in {mailbox!r}",
+            "error_type": "message_not_found",
+        }
+    except MailAttachmentTooLargeError as e:
+        return {"success": False, "error": str(e), "error_type": "too_large"}
+    except RuntimeError as e:
+        return {"success": False, "error": str(e), "error_type": "imap_unavailable"}
+    except Exception as e:
+        logger.error(f"Error saving message: {e}")
+        return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
 @_tool(
@@ -2764,6 +2917,116 @@ def _resolve_draft_seed(
     return "new", None, False
 
 
+def _stage_message_attachments(
+    specs: list[dict[str, Any]],
+) -> tuple[list[str], str | None, dict[str, Any] | None]:
+    """Copy attachments (or whole mails as .eml) of existing messages to a
+    private temp dir so ``create_draft`` can attach them in one step.
+
+    Each spec: ``{message_id, account, mailbox, attachment_indices?, as_eml?}``.
+    ``as_eml=True`` attaches the complete message as an ``.eml`` file instead
+    of its attachments. Returns ``(paths, staging_dir, error)``; the caller
+    removes ``staging_dir`` once the draft is built. On error the directory is
+    already removed.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    root = tempfile.mkdtemp(prefix="amfm-attach-")
+    paths: list[str] = []
+
+    def _fail(msg: str, error_type: str = "validation_error") -> tuple[
+        list[str], str | None, dict[str, Any]
+    ]:
+        shutil.rmtree(root, ignore_errors=True)
+        return [], None, {
+            "success": False, "error": msg, "error_type": error_type,
+        }
+
+    try:
+        for i, spec in enumerate(specs):
+            message_id = str(spec.get("message_id") or "").strip()
+            account = spec.get("account")
+            mailbox = spec.get("mailbox")
+            if not message_id or not account or not mailbox:
+                return _fail(
+                    f"attach_from_message[{i}] needs message_id, account "
+                    "and mailbox"
+                )
+            sub = Path(root) / str(i)
+            sub.mkdir()
+            try:
+                if spec.get("as_eml"):
+                    mail.save_message(
+                        message_id=message_id, save_directory=sub,
+                        account=account, mailbox=mailbox,
+                    )
+                else:
+                    mail.save_attachments(
+                        message_id=message_id, save_directory=sub,
+                        attachment_indices=spec.get("attachment_indices"),
+                        account=account, mailbox=mailbox,
+                    )
+            except MailMessageNotFoundError:
+                return _fail(
+                    f"attach_from_message[{i}]: message {message_id!r} not "
+                    f"found in {mailbox!r}", "message_not_found",
+                )
+            files = sorted(f for f in sub.iterdir() if f.is_file())
+            if not files:
+                return _fail(
+                    f"attach_from_message[{i}]: message {message_id!r} has no "
+                    "attachment to attach (or the selected index does not "
+                    "exist). The draft was NOT created.",
+                    "no_attachments",
+                )
+            paths.extend(str(f) for f in files)
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return paths, root, None
+
+
+def _normalize_attachment_paths(
+    paths: list[str] | None,
+) -> tuple[list[Path] | None, dict[str, Any] | None]:
+    """Expand ``~`` (and make relative paths absolute) and verify each file.
+
+    The connector used to receive ``~/Downloads/x.pdf`` verbatim, fail to open
+    it, and (because a FileNotFoundError counts as an IMAP failure) silently
+    fall back to AppleScript, producing a draft without the attachment.
+    Failing loudly up front is the safe behaviour.
+
+    Returns ``(paths, None)`` on success (``None`` stays ``None``), or
+    ``(None, error_response)`` listing every missing file.
+    """
+    if paths is None:
+        return None, None
+    resolved: list[Path] = []
+    missing: list[str] = []
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = p.resolve()
+        if not p.is_file():
+            missing.append(str(raw))
+        resolved.append(p)
+    if missing:
+        return None, {
+            "success": False,
+            "error": "Attachment file(s) not found: " + ", ".join(missing),
+            "error_type": "file_not_found",
+            "missing_paths": missing,
+            "hint": (
+                "Pass the full path on the Mac that runs Mail (``~`` is "
+                "supported). To attach a file from another email, save it "
+                "first with save_attachments and use the returned path."
+            ),
+        }
+    return resolved, None
+
+
 def _resolve_draft_attachments(
     draft_id: str,
     attachment_paths: list[str] | None,
@@ -2784,7 +3047,7 @@ def _resolve_draft_attachments(
     if attachment_paths is not None:
         if attachment_paths == []:
             return [], None
-        return [Path(p) for p in attachment_paths], None
+        return [Path(p).expanduser() for p in attachment_paths], None
 
     if not existing_names:
         return None, None
@@ -2832,19 +3095,14 @@ def _validate_draft_common_inputs(
     """Param-shape checks shared by create_draft and update_draft. Returns a
     validation_error response, or None when inputs are valid.
 
-    HTML drafts (#251) have no send path (send_now is AppleScript, which is
-    plain-text only), so body_html + send_now is rejected here.
+    body_html + send_now is allowed: it is sent over SMTP (never through
+    AppleScript, which is plain-text only) and fails with nothing sent when
+    SMTP cannot engage.
     """
     if template_vars and not template_name:
         return {
             "success": False,
             "error": "template_vars requires template_name",
-            "error_type": "validation_error",
-        }
-    if body_html is not None and send_now:
-        return {
-            "success": False,
-            "error": "body_html cannot be combined with send_now",
             "error_type": "validation_error",
         }
     return None
@@ -2856,8 +3114,9 @@ def _validate_create_draft_seed_inputs(
     body_html: str | None,
 ) -> dict[str, Any] | None:
     """create_draft seed-shape checks. Returns a validation_error response,
-    or None when valid. HTML reply/forward quoting is out of scope (#251),
-    so body_html is fresh-draft-only.
+    or None when valid. body_html is supported for fresh drafts and for
+    replies (HTML body above a cite-blockquote of the original); HTML
+    forwards are not supported.
     """
     if reply_to and forward_of:
         return {
@@ -2865,12 +3124,12 @@ def _validate_create_draft_seed_inputs(
             "error": "reply_to and forward_of are mutually exclusive",
             "error_type": "validation_error",
         }
-    if body_html is not None and (reply_to or forward_of):
+    if body_html is not None and forward_of:
         return {
             "success": False,
             "error": (
-                "body_html is only supported for fresh drafts, not "
-                "reply_to/forward_of"
+                "body_html is supported for fresh drafts and reply_to, "
+                "not forward_of"
             ),
             "error_type": "validation_error",
         }
@@ -3081,11 +3340,13 @@ async def create_draft(
     body: str = "",
     body_html: str | None = None,
     attachment_paths: StrList | None = None,
+    attach_from_message: DictList | None = None,
     reply_all: bool = False,
     template_name: str | None = None,
     template_vars: StrDict | None = None,
     from_account: str | None = None,
     send_now: bool = False,
+    quote_attribution: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Create a draft (fresh, reply, or forward). Optionally send immediately.
@@ -3124,12 +3385,33 @@ async def create_draft(
             from ``body``, or derived from the HTML when ``body`` is empty).
             HTML drafts are created over the clean IMAP path, so they
             REQUIRE IMAP credentials for the account and are limited to
-            fresh save-as-draft: passing ``body_html`` with ``send_now`` or
-            with ``reply_to``/``forward_of`` is rejected, and if IMAP can't
-            engage the call fails (``error_type: "html_requires_imap"``)
-            rather than silently downgrading to plain text. HTML is
-            caller-trusted (not sanitized). (#251)
+            save-as-draft or send: ``body_html`` with ``forward_of`` is
+            rejected, and if IMAP (draft) or SMTP (``send_now``) can't engage
+            the call fails (``error_type: "html_requires_imap"``, nothing
+            sent) rather than silently downgrading to plain text.
+            ``body_html`` + ``send_now=True`` goes out over SMTP only, needs
+            an explicit ``from_account``, and always asks the user for
+            confirmation first. With ``reply_to`` the draft
+            is a real reply (``In-Reply-To``/``References`` set, ``Re:``
+            subject and recipients derived) whose body is your HTML followed
+            by an attribution line and a ``<blockquote type="cite">`` holding
+            the original (its HTML part when it has one) — so put your own
+            signature at the end of ``body_html``. For replies to filed mail
+            pass ``seed_mailbox`` and an RFC Message-ID as ``reply_to``.
+            HTML is caller-trusted (not sanitized). (#251)
+        quote_attribution: HTML replies only: override the attribution line
+            above the quoted original (default ``On <date>, <from> wrote:``),
+            e.g. a Dutch "Op <datum> heeft <naam> <adres> het volgende
+            geschreven:". Plain text; it is HTML-escaped.
         attachment_paths: List of file paths to attach.
+        attach_from_message: Attach files from existing mails in one step,
+            without a separate ``save_attachments``. A list of
+            ``{"message_id", "account", "mailbox", "attachment_indices"?,
+            "as_eml"?}``: ``attachment_indices`` (0-based) picks specific
+            attachments (default all); ``"as_eml": true`` attaches the whole
+            mail as an ``.eml`` file instead. Combines with
+            ``attachment_paths``. Fails before any draft is created if a
+            mail or attachment is missing.
         reply_all: For ``reply_to`` only — use ``reply to all``.
         template_name: Optional template to render for ``subject`` and
             ``body``. Caller-supplied ``subject``/``body`` override the
@@ -3219,28 +3501,48 @@ async def create_draft(
         # ----------------------------------------------------------------
         # Connector call
         # ----------------------------------------------------------------
-        attachment_path_objs = (
-            [Path(p) for p in attachment_paths]
-            if attachment_paths is not None
-            else None
+        all_attachment_paths = list(attachment_paths or [])
+        staging_dir: str | None = None
+        if attach_from_message:
+            staged, staging_dir, stage_err = _stage_message_attachments(
+                attach_from_message
+            )
+            if stage_err:
+                return stage_err
+            all_attachment_paths.extend(staged)
+        attachment_path_objs, attach_err = _normalize_attachment_paths(
+            all_attachment_paths or None
         )
-        warnings: list[str] = []
-        result = mail.create_draft(
-            seed=seed_kind,
-            seed_id=seed_id,
-            seed_mailbox=seed_mailbox,
-            to=to,
-            cc=cc,
-            bcc=bcc,
-            subject=subject,
-            body=body,
-            body_html=body_html,
-            attachment_paths=attachment_path_objs,
-            reply_all=reply_all,
-            from_account=from_account,
-            send_now=send_now,
-            on_warning=warnings.append,
-        )
+        if attach_err:
+            if staging_dir:
+                import shutil
+
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            return attach_err
+        try:
+            warnings: list[str] = []
+            result = mail.create_draft(
+                seed=seed_kind,
+                seed_id=seed_id,
+                seed_mailbox=seed_mailbox,
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                body_html=body_html,
+                attachment_paths=attachment_path_objs,
+                reply_all=reply_all,
+                from_account=from_account,
+                send_now=send_now,
+                on_warning=warnings.append,
+                **({"quote_attribution": quote_attribution} if quote_attribution else {}),
+            )
+        finally:
+            if staging_dir:
+                import shutil
+
+                shutil.rmtree(staging_dir, ignore_errors=True)
         draft_id = result.get("draft_id", "")
 
         _persist_draft_seed(
@@ -3379,6 +3681,12 @@ async def update_draft(
         final_to, final_cc, final_bcc = _merge_draft_recipients(
             to, cc, bcc, state,
         )
+
+        if attachment_paths:
+            norm_paths, attach_err = _normalize_attachment_paths(attachment_paths)
+            if attach_err:
+                return attach_err
+            attachment_paths = [str(p) for p in (norm_paths or [])]
 
         # tempdir (if any) is cleaned up in the finally block.
         final_attachments, tempdir = _resolve_draft_attachments(
