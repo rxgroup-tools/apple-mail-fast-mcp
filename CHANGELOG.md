@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0-rx2] - 2026-11-18 (RX Group build, package version 0.11.0.post6)
+
+Fork-specific changes on top of upstream 0.11.0. The tool surface grows from 25 to 26 tools.
+
+### Added
+
+- **`save_message`:** write a whole message as an `.eml` file over IMAP (never overwrites an existing file).
+- **`create_draft(attach_from_message=[...])`:** attach attachments of existing mails, or a whole mail as `.eml` (`as_eml`), in one step. Fails before any draft exists when a mail or attachment is missing.
+- **HTML replies:** `create_draft(reply_to=..., body_html=...)` builds a real reply with the original quoted in a cite-blockquote; `quote_attribution` overrides the attribution line.
+- **`body_html` + `send_now`:** sent over SMTP only (never AppleScript). Fails with nothing sent when SMTP cannot engage, and always asks for confirmation (fail-closed; clients without elicitation, such as Claude Desktop, cannot send).
+
+### Fixed
+
+- **`get_messages` no longer returns a silent empty result** for messages that could not be fetched: `message_not_found` with `missing_ids`, and `warnings` for partial results. Ids with stray whitespace or tabs (folded `Message-ID` headers) are accepted.
+- **`update_message` no longer reports success when nothing was updated:** `message_not_found` with a hint when 0 messages were updated, a warning when only some were.
+- **Attachment robustness:** metadata is read per property (best effort), the MIME type is derived from the file name when Mail.app cannot provide it, and incomplete metadata yields a warning.
+- **Account name or UUID:** IMAP host/port/login overrides resolve under either form.
+- **Folders without the server namespace prefix** (`Drafts` instead of `INBOX.Drafts`) fall back to the prefixed form.
+- **`attachment_paths`:** `~` is expanded, and a missing file fails with `file_not_found` before any draft is created.
+- **Sent messages no longer carry the Mail.app draft marker headers** (`X-Uniform-Type-Identifier`, `X-Mail-Created-Date`).
+
 ## [0.11.0] - 2026-08-28
 
 A large release dominated by one theme: **Mail.app no longer freezes.** Mail does not index the RFC 5322 `message id` property, and AppleScript runs on Mail's UI thread — so every `whose message id is "X"` lookup loaded tens of thousands of message objects on the thread that draws the app. Four separate code paths did this (#415, #419, #432, #437); all four are now indexed or bounded, and an integration test asserts Mail answers a trivial AppleScript *while* each operation runs. Also here: the draft lifecycle works on localized Mail.app and Gmail, threads that come back incomplete now say so, and one new tool (24 → 25).
