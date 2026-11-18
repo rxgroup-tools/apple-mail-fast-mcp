@@ -2028,6 +2028,47 @@ class ImapConnector:
                 client.remove_flags(uids, [b"\\Flagged"], silent=True)
             return len(uids)
 
+    def set_answered_status(
+        self,
+        message_ids: list[str],
+        source_mailbox: str,
+        answered: bool,
+    ) -> int:
+        """Set or clear the IMAP \\Answered flag via UID STORE.
+
+        \\Answered is RFC 3501 base IMAP, so it needs no capability check.
+        Mail.app shows it as the curved reply arrow next to a message.
+        Mail.app only sets it itself when a reply composed in Mail is sent;
+        drafts created over IMAP carry the reply headers but not the flag.
+
+        Args:
+            message_ids: RFC 5322 Message-IDs, with or without brackets.
+            source_mailbox: Mailbox the messages live in.
+            answered: True to set \\Answered, False to clear it.
+
+        Returns:
+            Count of resolved + updated messages. Message-IDs that don't
+            resolve to a UID are silently skipped.
+
+        Raises:
+            IMAPClientError: SELECT / SEARCH / STORE failed.
+        """
+        _validate_message_ids(message_ids)
+        _reject_control_chars(source_mailbox, "source_mailbox")
+
+        with self._session() as client:
+            _select_folder(client, source_mailbox, readonly=False)
+
+            uids = self._resolve_uids_batch(client, message_ids)
+            if not uids:
+                return 0
+
+            if answered:
+                client.add_flags(uids, [b"\\Answered"], silent=True)
+            else:
+                client.remove_flags(uids, [b"\\Answered"], silent=True)
+            return len(uids)
+
     @staticmethod
     def _has_capability(client: IMAPClient, name: bytes) -> bool:
         """True if ``name`` (e.g. ``b"X-GM-EXT-1"``) is in the post-login

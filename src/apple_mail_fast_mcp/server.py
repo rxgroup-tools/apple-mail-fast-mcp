@@ -1380,6 +1380,7 @@ def update_message(
     account: str | None = None,
     source_mailbox: str | None = None,
     gmail_mode: bool = False,
+    answered: bool | None = None,
 ) -> dict[str, Any]:
     """
     Update one or more messages: change read state, flag, and/or move,
@@ -1419,6 +1420,13 @@ def update_message(
             returns `error_type: "imap_required"` — configure IMAP with
             `apple-mail-fast-mcp setup-imap --account <name>`. Slated for
             removal at v1.0.
+        answered: True to set the IMAP ``\\Answered`` flag (the reply arrow
+            in Mail), False to clear it. Use it on the ORIGINAL message
+            after the user has sent a reply made with ``create_draft``:
+            Mail does not set it for drafts created over IMAP. Needs
+            ``account`` and ``source_mailbox``, works over IMAP only
+            (``error_type: "imap_required"`` otherwise) and cannot be
+            combined with the other fields; call it separately.
 
     Returns:
         Dictionary with `updated` (int count) and `requested` (input count).
@@ -1452,12 +1460,35 @@ def update_message(
             and flagged is None
             and flag_color is None
             and destination_mailbox is None
+            and answered is None
         ):
             return {
                 "success": False,
                 "error": "specify at least one field to update",
                 "error_type": "validation_error",
             }
+
+        if answered is not None:
+            if (
+                read_status is not None
+                or flagged is not None
+                or flag_color is not None
+                or destination_mailbox is not None
+            ):
+                return {
+                    "success": False,
+                    "error": (
+                        "answered cannot be combined with other fields; "
+                        "call update_message separately"
+                    ),
+                    "error_type": "validation_error",
+                }
+            if not account or not source_mailbox:
+                return {
+                    "success": False,
+                    "error": "answered needs account and source_mailbox",
+                    "error_type": "validation_error",
+                }
 
         # Test-mode safety: when account is provided (moves, or narrow-path),
         # gate against MAIL_TEST_ACCOUNT.
@@ -1491,20 +1522,29 @@ def update_message(
             f"dest={destination_mailbox})"
         )
 
-        count = mail.update_message(
-            message_ids,
-            read_status=read_status,
-            flagged=flagged,
-            flag_color=flag_color,
-            destination_mailbox=destination_mailbox,
-            account=account,
-            source_mailbox=source_mailbox,
-            gmail_mode=gmail_mode,
-        )
+        if answered is not None:
+            count = mail.set_answered_status(
+                message_ids,
+                account=cast(str, account),
+                source_mailbox=cast(str, source_mailbox),
+                answered=answered,
+            )
+        else:
+            count = mail.update_message(
+                message_ids,
+                read_status=read_status,
+                flagged=flagged,
+                flag_color=flag_color,
+                destination_mailbox=destination_mailbox,
+                account=account,
+                source_mailbox=source_mailbox,
+                gmail_mode=gmail_mode,
+            )
 
         operation_logger.log_operation(
             "update_message",
             {
+                "answered": answered,
                 "count": len(message_ids),
                 "read_status": read_status,
                 "flagged": flagged,

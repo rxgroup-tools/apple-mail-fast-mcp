@@ -3866,6 +3866,55 @@ class AppleMailConnector:
         target.write_bytes(raw)
         return {"path": str(target), "name": target.name, "size": len(raw)}
 
+    def set_answered_status(
+        self,
+        message_ids: list[str],
+        *,
+        account: str,
+        source_mailbox: str,
+        answered: bool,
+    ) -> int:
+        """Set or clear the ``\\Answered`` flag (Mail's reply arrow) over IMAP.
+
+        IMAP only: AppleScript has no dependable way to set it, so an
+        unreachable IMAP server is an error here rather than a silent no-op.
+
+        Returns:
+            Count of messages updated (0 when none were found).
+
+        Raises:
+            MailImapRequiredError: IMAP unavailable for the account.
+        """
+        try:
+            return self._imap_set_answered_status(
+                account=account,
+                message_ids=message_ids,
+                source_mailbox=source_mailbox,
+                answered=answered,
+            )
+        except _IMAP_FALLBACK_EXCS as exc:
+            raise MailImapRequiredError(
+                f"Setting the answered flag needs IMAP, which is unavailable "
+                f"for {account!r}: {exc}"
+            ) from exc
+
+    def _imap_set_answered_status(
+        self,
+        *,
+        account: str,
+        message_ids: list[str],
+        source_mailbox: str,
+        answered: bool,
+    ) -> int:
+        host, port, email_addr = self._resolve_imap_config(account)
+        password = self._get_imap_password_with_fallback(account, email_addr)
+        imap = ImapConnector(host, port, email_addr, password, pool=self._imap_pool)
+        return imap.set_answered_status(
+            message_ids=message_ids,
+            source_mailbox=source_mailbox,
+            answered=answered,
+        )
+
     def save_attachments(
         self,
         message_id: str,
