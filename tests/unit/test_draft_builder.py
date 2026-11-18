@@ -681,3 +681,104 @@ def test_message_id_domain_falls_back_when_sender_has_no_domain():
         body="body",
     )
     assert msgid.endswith("@localhost>")
+
+
+# --- HTML replies -----------------------------------------------------------
+
+
+def test_build_reply_html_puts_new_html_above_cite_blockquote():
+    from apple_mail_fast_mcp.draft_builder import build_reply_html
+
+    out = build_reply_html(
+        new_html="<div><p>Dank!</p></div>",
+        original_from="Lazar <lazar@hadleigh.co.uk>",
+        original_date="29 May 2026 14:10",
+        original_html="<html><head><style>p{}</style></head>"
+        "<body><p>Hi <b>Frederic</b></p><script>x()</script></body></html>",
+        original_text="Hi Frederic",
+    )
+    assert out.startswith("<div><p>Dank!</p></div>")
+    assert "On 29 May 2026 14:10, Lazar &lt;lazar@hadleigh.co.uk&gt; wrote:" in out
+    assert '<blockquote type="cite"' in out
+    assert "<p>Hi <b>Frederic</b></p>" in out
+    for gone in ("<script", "<style", "<head", "<body", "<html"):
+        assert gone not in out
+    assert out.index("Dank!") < out.index("<blockquote")
+
+
+def test_build_reply_html_falls_back_to_escaped_text_and_custom_attribution():
+    from apple_mail_fast_mcp.draft_builder import build_reply_html
+
+    out = build_reply_html(
+        new_html="<p>ok</p>",
+        original_from="x",
+        original_date="y",
+        original_html="",
+        original_text="a < b\nsecond line",
+        attribution="Op 17 nov 2026 heeft Lazar <l@x.nl> het volgende geschreven:",
+    )
+    assert "a &lt; b<br>\nsecond line" in out
+    assert "Op 17 nov 2026 heeft Lazar &lt;l@x.nl&gt; het volgende geschreven:" in out
+    assert "wrote:" not in out
+
+
+def test_build_reply_plain_alternative_quotes_with_gt():
+    from apple_mail_fast_mcp.draft_builder import build_reply_plain_alternative
+
+    out = build_reply_plain_alternative(
+        new_body="Dank!",
+        original_from="Lazar",
+        original_date="d",
+        original_text="regel een\n\nregel twee",
+    )
+    assert out.startswith("Dank!\n\nOn d, Lazar wrote:\n")
+    assert "> regel een\n>\n> regel twee" in out
+
+
+def test_parse_original_message_keeps_html_part():
+    from email.message import EmailMessage
+
+    from apple_mail_fast_mcp.draft_builder import parse_original_message
+
+    m = EmailMessage()
+    m["From"] = "a@x.com"
+    m["Message-ID"] = "<o@x>"
+    m.set_content("plain version")
+    m.add_alternative("<p>html version</p>", subtype="html")
+    orig = parse_original_message(m.as_bytes())
+    assert "plain version" in orig.text
+    assert "<p>html version</p>" in orig.html
+
+
+def test_draft_carries_apple_mail_draft_marker() -> None:
+    from email import message_from_bytes
+
+    _, raw = build_draft_mime(
+        sender="a@x.nl", to=["b@x.nl"], subject="s", body="hi"
+    )[:2]
+    parsed = message_from_bytes(raw)
+    assert parsed["X-Uniform-Type-Identifier"] == "com.apple.mail-draft"
+    assert parsed["X-Mail-Created-Date"] == parsed["Date"]
+
+
+class TestMarkAsDraft:
+    def _headers(self, **kw: object) -> object:
+        import email
+
+        from apple_mail_fast_mcp.draft_builder import build_draft_mime
+
+        _mid, raw = build_draft_mime(
+            sender="me@example.invalid", to=["a@example.invalid"],
+            subject="s", body="b", **kw,  # type: ignore[arg-type]
+        )
+        return email.message_from_bytes(raw)
+
+    def test_default_marks_message_as_mail_draft(self) -> None:
+        msg = self._headers()
+        assert msg["X-Uniform-Type-Identifier"] == "com.apple.mail-draft"
+        assert msg["X-Mail-Created-Date"]
+
+    def test_sent_message_has_no_draft_marker(self) -> None:
+        msg = self._headers(mark_as_draft=False)
+        assert msg["X-Uniform-Type-Identifier"] is None
+        assert msg["X-Mail-Created-Date"] is None

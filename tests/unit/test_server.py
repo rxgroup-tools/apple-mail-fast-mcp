@@ -44,6 +44,7 @@ from apple_mail_fast_mcp.server import (
     list_templates,
     render_template,
     save_attachments,
+    save_message,
     save_template,
     search_messages,
     update_message,
@@ -1593,6 +1594,43 @@ class TestGetMessages:
 
         assert result["success"] is True
         assert [m["id"] for m in result["messages"]] == ["good"]
+        # ...but the dropped id is reported, never silent.
+        assert result["missing_ids"] == ["bogus"]
+        assert "warnings" in result
+
+    def test_ids_with_surrounding_whitespace_are_stripped(
+        self, mock_mail: MagicMock
+    ) -> None:
+        """A tab-prefixed id from an older read must not poison the batch."""
+        mock_mail.get_message.return_value = {"id": "x", "subject": "s"}
+
+        result = get_messages(["\t<abc@host>", " def@host "])
+
+        assert result["success"] is True
+        seen = [c.args[0] for c in mock_mail.get_message.call_args_list]
+        assert seen == ["<abc@host>", "def@host"]
+
+    def test_all_ids_missing_is_an_error_not_an_empty_result(
+        self, mock_mail: MagicMock
+    ) -> None:
+        """A failed fetch must not look like an empty mail (silent-failure bug)."""
+        mock_mail.get_message.side_effect = MailMessageNotFoundError("gone")
+
+        result = get_messages(["443161"], account="A", mailbox="INBOX")
+
+        assert result["success"] is False
+        assert result["error_type"] == "message_not_found"
+        assert result["missing_ids"] == ["443161"]
+        assert "include_attachments=false" in result["hint"]
+
+    def test_all_found_has_no_missing_fields(self, mock_mail: MagicMock) -> None:
+        mock_mail.get_message.return_value = {"id": "ok", "subject": "s"}
+
+        result = get_messages(["ok"])
+
+        assert result["success"] is True
+        assert "missing_ids" not in result
+        assert "warnings" not in result
 
     def test_imap_hint_params_pass_through_per_id(
         self, mock_mail: MagicMock
@@ -1668,6 +1706,42 @@ class TestGetMessages:
 
 
 class TestUpdateMessage:
+    # ---- Silent-failure guard -------------------------------------------
+
+    def test_zero_updated_is_an_error_not_a_success(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail.update_message.return_value = 0
+        result = update_message(["1", "2"], flagged=True)
+
+        assert result["success"] is False
+        assert result["error_type"] == "message_not_found"
+        assert result["updated"] == 0 and result["requested"] == 2
+        assert "source_mailbox" in result["hint"]
+
+    def test_partial_update_succeeds_with_warning(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail.update_message.return_value = 1
+        result = update_message(["1", "2"], flagged=True)
+
+        assert result["success"] is True
+        assert result["updated"] == 1 and result["requested"] == 2
+        assert "Only 1 of 2" in result["warnings"][0]
+
+    def test_full_update_has_no_warnings(self, mock_mail: MagicMock) -> None:
+        mock_mail.update_message.return_value = 2
+        result = update_message(["1", "2"], flagged=True)
+
+        assert result["success"] is True
+        assert "warnings" not in result
+
+    def test_whitespace_in_ids_is_stripped(self, mock_mail: MagicMock) -> None:
+        mock_mail.update_message.return_value = 1
+        update_message([" <abc@x>\t"], flagged=True)
+
+        assert mock_mail.update_message.call_args.args[0] == ["<abc@x>"]
+
     # ---- Validation -----------------------------------------------------
 
     def test_no_fields_returns_validation_error(
@@ -3247,14 +3321,14 @@ class TestCreateDraftTool:
         assert kwargs["body_html"] == "<p>rich</p>"
 
     @pytest.mark.asyncio
-    async def test_body_html_with_send_now_rejected(
+    async def test_body_html_with_send_now_requires_confirmation(
         self,
         isolated_drafts: Any,
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        """#251: no HTML send path — body_html + send_now is a
-        validation_error and never reaches the connector."""
+        """body_html + send_now is allowed but gated: without a confirmation
+        context nothing reaches the connector (fail closed)."""
         from apple_mail_fast_mcp.server import create_draft
 
         result = await create_draft(
@@ -3262,26 +3336,52 @@ class TestCreateDraftTool:
             body_html="<p>rich</p>", send_now=True,
         )
         assert result["success"] is False
-        assert result["error_type"] == "validation_error"
+        assert result["error_type"] == "confirmation_required"
         mock_mail.create_draft.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_body_html_with_reply_to_rejected(
+    async def test_body_html_with_forward_of_rejected(
         self,
         isolated_drafts: Any,
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        """#251: HTML reply/forward is out of scope — rejected as a
-        validation_error before the connector."""
+        """HTML forwards are unsupported — rejected as a validation_error
+        before the connector."""
         from apple_mail_fast_mcp.server import create_draft
 
         result = await create_draft(
-            reply_to="160989", body_html="<p>rich</p>",
+            forward_of="160989", to=["a@example.com"],
+            body_html="<p>rich</p>",
         )
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
         mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_body_html_with_reply_to_threads_to_connector(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """HTML replies: body_html and quote_attribution reach the
+        connector with seed="reply"."""
+        from apple_mail_fast_mcp.server import create_draft
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161099", "sent_message_id": "",
+        }
+        result = await create_draft(
+            reply_to="<orig@x>", body_html="<p>rich</p>",
+            from_account="Julian | RX Group",
+            quote_attribution="Op dinsdag schreef X:",
+        )
+        assert result["success"] is True
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "reply"
+        assert kwargs["body_html"] == "<p>rich</p>"
+        assert kwargs["quote_attribution"] == "Op dinsdag schreef X:"
 
     @pytest.mark.asyncio
     async def test_body_html_unavailable_maps_to_html_requires_imap(
@@ -4111,6 +4211,51 @@ class TestDraftToolErrorPaths:
         assert result["error_type"] == "file_not_found"
 
     @pytest.mark.asyncio
+    async def test_create_draft_expands_tilde_in_attachment_paths(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        tmp_path: Any,
+        monkeypatch: Any,
+    ) -> None:
+        """Regression: `~/Downloads/x.pdf` was passed verbatim, failed, and
+        the draft silently lost its attachment."""
+        from apple_mail_fast_mcp.server import create_draft
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / "Downloads").mkdir()
+        (tmp_path / "Downloads" / "x.pdf").write_bytes(b"%PDF")
+        mock_mail.create_draft.return_value = {"draft_id": "d1"}
+
+        await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            attachment_paths=["~/Downloads/x.pdf"],
+        )
+
+        passed = mock_mail.create_draft.call_args.kwargs["attachment_paths"]
+        assert passed == [tmp_path / "Downloads" / "x.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_create_draft_missing_attachment_fails_before_connector(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_fast_mcp.server import create_draft
+
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            attachment_paths=["~/Downloads/does-not-exist.pdf"],
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "file_not_found"
+        assert result["missing_paths"] == ["~/Downloads/does-not-exist.pdf"]
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_create_draft_applescript_error(
         self,
         isolated_drafts: Any,
@@ -4621,3 +4766,172 @@ class TestConnectorCreateDraftEdgeCase:
             connector.create_draft(
                 seed="reply", seed_id="160000", body="x"
             )
+
+
+# ---------------------------------------------------------------------------
+# save_message (.eml export)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveMessage:
+    def test_success_returns_path(self, mock_mail: Any, tmp_path: Any) -> None:
+        mock_mail.save_message.return_value = {
+            "path": str(tmp_path / "a.eml"), "name": "a.eml", "size": 5}
+        result = save_message(" <m@x>", str(tmp_path), "Acc", "INBOX")
+        assert result["success"] is True
+        assert result["name"] == "a.eml"
+        assert mock_mail.save_message.call_args.kwargs["message_id"] == "<m@x>"
+
+    def test_tilde_directory_is_expanded(self, mock_mail: Any) -> None:
+        from pathlib import Path
+        mock_mail.save_message.return_value = {"path": "p", "name": "n", "size": 1}
+        save_message("m", "~/Downloads", "Acc", "INBOX")
+        used = mock_mail.save_message.call_args.kwargs["save_directory"]
+        assert "~" not in str(used) and isinstance(used, Path)
+
+    def test_not_found(self, mock_mail: Any, tmp_path: Any) -> None:
+        from apple_mail_fast_mcp.exceptions import MailMessageNotFoundError
+        mock_mail.save_message.side_effect = MailMessageNotFoundError("x")
+        result = save_message("m", str(tmp_path), "Acc", "INBOX")
+        assert result["success"] is False
+        assert result["error_type"] == "message_not_found"
+
+    def test_imap_unavailable(self, mock_mail: Any, tmp_path: Any) -> None:
+        mock_mail.save_message.side_effect = RuntimeError("needs IMAP")
+        result = save_message("m", str(tmp_path), "Acc", "INBOX")
+        assert result["error_type"] == "imap_unavailable"
+
+    def test_bad_directory(self, mock_mail: Any, tmp_path: Any) -> None:
+        mock_mail.save_message.side_effect = FileNotFoundError("nope")
+        result = save_message("m", str(tmp_path / "x"), "Acc", "INBOX")
+        assert result["error_type"] == "validation_error"
+
+
+# ---------------------------------------------------------------------------
+# create_draft(attach_from_message=...)
+# ---------------------------------------------------------------------------
+
+
+async def _call(args: dict[str, Any]) -> dict[str, Any]:
+    from apple_mail_fast_mcp.server import create_draft
+
+    return await create_draft(**args)
+
+
+class TestCreateDraftAttachFromMessage:
+    @pytest.fixture
+    def staged(
+        self, isolated_drafts: Any, mock_mail: Any, mock_logger: Any
+    ) -> Any:
+        """save_attachments/save_message write one file into the target dir."""
+        from pathlib import Path
+
+        def _save_attachments(**kw: Any) -> dict[str, Any]:
+            (Path(kw["save_directory"]) / "cv.pdf").write_bytes(b"%PDF")
+            return {"saved": 1, "rejected": []}
+
+        def _save_message(**kw: Any) -> dict[str, Any]:
+            (Path(kw["save_directory"]) / "mail.eml").write_bytes(b"x")
+            return {"path": "p", "name": "mail.eml", "size": 1}
+
+        mock_mail.save_attachments.side_effect = _save_attachments
+        mock_mail.save_message.side_effect = _save_message
+        mock_mail.create_draft.return_value = {"draft_id": "d1"}
+        return mock_mail
+
+    @pytest.mark.asyncio
+    async def test_attachments_are_staged_passed_and_cleaned_up(
+        self, staged: Any
+    ) -> None:
+        from pathlib import Path
+
+        seen: dict[str, Any] = {}
+
+        def _create(**kw: Any) -> dict[str, Any]:
+            seen["paths"] = [Path(p) for p in kw["attachment_paths"]]
+            seen["existed"] = [p.exists() for p in seen["paths"]]
+            return {"draft_id": "d1"}
+
+        staged.create_draft.side_effect = _create
+        result = await _call({
+            "to": ["a@example.invalid"], "subject": "s", "body": "b",
+            "attach_from_message": [
+                {"message_id": "m1", "account": "A", "mailbox": "INBOX",
+                 "attachment_indices": [0]},
+            ],
+        })
+        assert result["success"] is True
+        assert [p.name for p in seen["paths"]] == ["cv.pdf"]
+        assert seen["existed"] == [True]
+        # temp dir removed after the draft was built
+        assert not seen["paths"][0].exists()
+        kw = staged.save_attachments.call_args.kwargs
+        assert kw["attachment_indices"] == [0] and kw["account"] == "A"
+
+    @pytest.mark.asyncio
+    async def test_as_eml_uses_save_message(self, staged: Any) -> None:
+        result = await _call({
+            "to": ["a@example.invalid"], "subject": "s", "body": "b",
+            "attach_from_message": [
+                {"message_id": "m1", "account": "A", "mailbox": "INBOX",
+                 "as_eml": True},
+            ],
+        })
+        assert result["success"] is True
+        staged.save_message.assert_called_once()
+        staged.save_attachments.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_combines_with_attachment_paths(
+        self, staged: Any, tmp_path: Any
+    ) -> None:
+        extra = tmp_path / "extra.txt"
+        extra.write_text("x")
+        result = await _call({
+            "to": ["a@example.invalid"], "subject": "s", "body": "b",
+            "attachment_paths": [str(extra)],
+            "attach_from_message": [
+                {"message_id": "m1", "account": "A", "mailbox": "INBOX"},
+            ],
+        })
+        assert result["success"] is True
+        names = sorted(
+            p.name for p in staged.create_draft.call_args.kwargs["attachment_paths"]
+        )
+        assert names == ["cv.pdf", "extra.txt"]
+
+    @pytest.mark.asyncio
+    async def test_no_attachments_fails_before_draft(self, staged: Any) -> None:
+        staged.save_attachments.side_effect = lambda **kw: {
+            "saved": 0, "rejected": []}
+        result = await _call({
+            "to": ["a@example.invalid"], "subject": "s", "body": "b",
+            "attach_from_message": [
+                {"message_id": "m1", "account": "A", "mailbox": "INBOX"},
+            ],
+        })
+        assert result["success"] is False
+        assert result["error_type"] == "no_attachments"
+        staged.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_message_fails_before_draft(self, staged: Any) -> None:
+        from apple_mail_fast_mcp.exceptions import MailMessageNotFoundError
+        staged.save_attachments.side_effect = MailMessageNotFoundError("x")
+        result = await _call({
+            "to": ["a@example.invalid"], "subject": "s", "body": "b",
+            "attach_from_message": [
+                {"message_id": "m1", "account": "A", "mailbox": "INBOX"},
+            ],
+        })
+        assert result["error_type"] == "message_not_found"
+        staged.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_incomplete_spec_is_rejected(self, staged: Any) -> None:
+        result = await _call({
+            "to": ["a@example.invalid"], "subject": "s", "body": "b",
+            "attach_from_message": [{"message_id": "m1"}],
+        })
+        assert result["success"] is False
+        staged.create_draft.assert_not_called()

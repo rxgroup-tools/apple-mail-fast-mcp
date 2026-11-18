@@ -4560,6 +4560,84 @@ class TestDualEmitRfcMessageId:
         assert result["rfc_message_id"] == "rfc-100@example.com"
 
     @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_applescript_attachment_props_are_best_effort(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Regression (silent-empty get_messages): a failing attachment property
+        must not abort the message lookup. Each property is read in its own
+        try, and the failure is flagged via `attachments_incomplete`."""
+        mock_run.return_value = (
+            '{"id": "100", "rfc_message_id": "r@x", "subject": "Hi",'
+            '"sender": "a@x", "date_received": "Mon", "read_status": true,'
+            '"flagged": false, "content": "body", "attachments": [],'
+            '"attachments_incomplete": false}'
+        )
+        connector._get_message_applescript(
+            "100", include_content=True, include_attachments=True
+        )
+        script = mock_run.call_args[0][0]
+        for prop in ("name of att", "MIME type of att", "file size of att",
+                     "downloaded of att"):
+            idx = script.index("(" + prop + ")")
+            # each read sits directly inside its own `try ... on error`
+            assert "try" in script[max(0, idx - 80):idx]
+            assert "on error" in script[idx:idx + 120]
+        assert "|attachments_incomplete|:attFailed" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_applescript_incomplete_attachments_yield_warning(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = (
+            '{"id": "100", "rfc_message_id": "r@x", "subject": "Hi",'
+            '"sender": "a@x", "date_received": "Mon", "read_status": true,'
+            '"flagged": false, "content": "body",'
+            '"attachments": [{"name": "cv.pdf", "mime_type": "", "size": 0,'
+            '"downloaded": false}], "attachments_incomplete": true}'
+        )
+        result = connector._get_message_applescript(
+            "100", include_content=True, include_attachments=True
+        )
+        assert result["content"] == "body"
+        assert "attachments_incomplete" not in result
+        assert len(result["warnings"]) == 1
+        assert "incomplete" in result["warnings"][0]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_applescript_complete_attachments_no_warning(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = (
+            '{"id": "100", "rfc_message_id": "r@x", "subject": "Hi",'
+            '"sender": "a@x", "date_received": "Mon", "read_status": true,'
+            '"flagged": false, "content": "body", "attachments": [],'
+            '"attachments_incomplete": false}'
+        )
+        result = connector._get_message_applescript(
+            "100", include_content=True, include_attachments=True
+        )
+        assert "warnings" not in result
+        assert "attachments_incomplete" not in result
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_applescript_fills_blank_mime_type(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = (
+            '{"id": "1", "rfc_message_id": "r@x", "subject": "s",'
+            '"sender": "a@x", "date_received": "Mon", "read_status": true,'
+            '"flagged": false, "content": "",'
+            '"attachments": [{"name": "CV.pdf", "mime_type": "", "size": 1,'
+            '"downloaded": true}], "attachments_incomplete": false}'
+        )
+        result = connector._get_message_applescript(
+            "1", include_content=False, include_attachments=True
+        )
+        assert result["attachments"][0]["mime_type"] == "application/pdf"
+        # a missing MIME type alone is not an "incomplete" warning
+        assert "warnings" not in result
+
+    @patch.object(AppleMailConnector, "_run_applescript")
     def test_missing_message_id_serializes_as_none(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
@@ -8294,6 +8372,37 @@ class TestCreateReplyForwardDraftViaImap:
         assert result["draft_id"] and result["draft_id"] != orig_mid
         mock_imap.fetch_raw_message.assert_called_once_with(orig_mid, "INBOX")
 
+    def test_html_reply_is_threaded_with_cite_blockquote(self, connector):
+        import email as _email
+        from email import policy as _policy
+        orig_mid, orig_raw = self._original()
+        mock_imap = MagicMock()
+        mock_imap.fetch_raw_message.return_value = orig_raw
+
+        result, raw = self._run(
+            connector, mock_imap,
+            seed="reply", seed_id=orig_mid, from_account="iCloud",
+            body="", body_html="<div><p>Thanks Lazar.</p><p>Groet</p></div>",
+            quote_attribution="Op 29 mei heeft Lazar het volgende geschreven:",
+        )
+        msg = _email.message_from_bytes(raw, policy=_policy.default)
+        # real reply, same as the plain path
+        assert msg["In-Reply-To"] == orig_mid
+        assert msg["Subject"] == "Re: Flat 9 Constable House"
+        assert msg["To"] == "Lazar <lazar@hadleigh.co.uk>"
+        assert msg.is_multipart()
+        html = msg.get_body(preferencelist=("html",)).get_content()
+        plain = msg.get_body(preferencelist=("plain",)).get_content()
+        assert html.startswith("<div><p>Thanks Lazar.</p><p>Groet</p></div>")
+        assert '<blockquote type="cite"' in html
+        assert "Op 29 mei heeft Lazar het volgende geschreven:" in html
+        assert "Hi Frederic," in html
+        assert html.index("Groet") < html.index("<blockquote")
+        # plain alternative derived from the HTML, with a >-quoted original
+        assert plain.startswith("Thanks Lazar.")
+        assert "> Hi Frederic," in plain
+        assert result["draft_id"] and result["draft_id"] != orig_mid
+
     def test_reply_all_ccs_others_minus_self(self, connector):
         import email as _email
         from email import policy as _policy
@@ -8988,6 +9097,79 @@ class TestSmtpSendPath:
             )
         assert result is None
         sender_cls.assert_not_called()
+
+    # --- HTML send over SMTP -------------------------------------------------
+
+    def test_html_compose_send_goes_over_smtp_without_draft_marker(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import email
+
+        self._configure_smtp(connector, monkeypatch)
+        monkeypatch.setattr(connector, "_run_applescript", lambda s: "")
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            result = connector._try_smtp_send(
+                seed="new", seed_id=None, seed_mailbox=None, send_now=True,
+                from_account="Gmail", to=["a@example.com"], cc=None, bcc=None,
+                subject="Hi", body="plain", reply_all=False,
+                attachment_paths=None, body_html="<p>rich <b>text</b></p>",
+            )
+        assert result == {"draft_id": "", "sent_message_id": ""}
+        raw, recipients = sender_cls.return_value.send.call_args.args
+        assert recipients == ["a@example.com"]
+        msg = email.message_from_bytes(raw)
+        assert msg.get_content_type() == "multipart/alternative"
+        types = [p.get_content_type() for p in msg.walk()]
+        assert "text/html" in types and "text/plain" in types
+        # A sent message must not carry the Mail.app draft marker.
+        assert msg["X-Uniform-Type-Identifier"] is None
+        assert msg["X-Mail-Created-Date"] is None
+
+    def test_html_reply_send_passes_html_and_skips_draft_marker(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._configure_smtp(connector, monkeypatch)
+        seen: dict[str, object] = {}
+
+        def _build(**kw: object) -> object:
+            seen.update(kw)
+            return ("<m@id>", b"rawreply", ["orig@example.net"])
+
+        monkeypatch.setattr(connector, "_build_reply_forward_mime", _build)
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender"):
+            connector._try_smtp_send(
+                seed="reply", seed_id="orig@id", seed_mailbox="INBOX",
+                send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
+                subject=None, body="", reply_all=False, attachment_paths=None,
+                body_html="<p>hoi</p>", quote_attribution="Op x schreef y:",
+            )
+        assert seen["body_html"] == "<p>hoi</p>"
+        assert seen["quote_attribution"] == "Op x schreef y:"
+        assert seen["mark_as_draft"] is False
+
+    def test_html_send_without_smtp_fails_and_never_uses_applescript(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from apple_mail_fast_mcp.exceptions import MailDraftHtmlUnavailableError
+
+        self._configure_smtp(connector, monkeypatch)
+
+        def _raise(account: str, email: str) -> str:
+            raise MailKeychainEntryNotFoundError("no opt-in")
+
+        monkeypatch.setattr(connector, "_get_imap_password_with_fallback", _raise)
+        scripts: list[str] = []
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            with pytest.raises(MailDraftHtmlUnavailableError, match="Nothing was sent"):
+                connector.create_draft(
+                    seed="new", to=["a@example.com"], subject="Hi", body="x",
+                    body_html="<p>x</p>", from_account="Gmail", send_now=True,
+                )
+        sender_cls.assert_not_called()
+        assert not any("send" in s and "theMessage" in s for s in scripts)
 
     # --- Sent-mailbox copy after a successful send (#406) -------------------
 
@@ -9976,3 +10158,65 @@ class TestNumericAnchorBoundedProbe:
         monkeypatch.setattr(connector, "_imap_get_thread", lambda a: [])
 
         connector.get_thread("12345")
+
+
+class TestImapOverridesResolveByNameOrUuid:
+    """Overrides are saved under the account NAME; callers often pass the
+    UUID. Without a bridge the port override was missed, Mail.app's wrong
+    port (143) was used and IMAP died with an SSL error."""
+
+    CONFIG = (
+        '{"host": "mail.example.nl", "port": 143, "user_name": "j@example.nl",'
+        '"email_addresses": ["j@example.nl"]}'
+    )
+
+    @pytest.fixture
+    def home(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        (tmp_path / "imap_server_overrides.json").write_text(
+            '{"Julian | RX Group": {"port": 993}}', encoding="utf-8"
+        )
+        return tmp_path
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_uuid_finds_override_saved_under_name(
+        self, mock_run: MagicMock, home: Any
+    ) -> None:
+        connector = AppleMailConnector(timeout=30)
+        mock_run.return_value = self.CONFIG
+        with patch.object(
+            AppleMailConnector,
+            "_alternative_account_identifier",
+            return_value="Julian | RX Group",
+        ):
+            host, port, email = connector._resolve_imap_config("UUID-1234")
+        assert port == 993
+        assert host == "mail.example.nl"
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_name_still_works_without_lookup(
+        self, mock_run: MagicMock, home: Any
+    ) -> None:
+        connector = AppleMailConnector(timeout=30)
+        mock_run.return_value = self.CONFIG
+        with patch.object(
+            AppleMailConnector, "_alternative_account_identifier"
+        ) as alt:
+            _, port, _ = connector._resolve_imap_config("Julian | RX Group")
+        assert port == 993
+        alt.assert_not_called()
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_no_overrides_means_no_extra_account_lookup(
+        self, mock_run: MagicMock, tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        connector = AppleMailConnector(timeout=30)
+        mock_run.return_value = self.CONFIG
+        with patch.object(
+            AppleMailConnector, "_alternative_account_identifier"
+        ) as alt:
+            _, port, _ = connector._resolve_imap_config("UUID-1234")
+        assert port == 143
+        alt.assert_not_called()

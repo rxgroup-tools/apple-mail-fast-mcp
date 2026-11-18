@@ -76,7 +76,8 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
-        assert "|name|:(name of att)" in script
+        assert "|name|:attName" in script
+        assert "set attName to (name of att)" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_script_quotes_size_key(
@@ -90,8 +91,40 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("msg-1")
         script = mock_run.call_args[0][0]
-        assert "|size|:(file size of att)" in script
+        assert "|size|:attSize" in script
+        assert "set attSize to (file size of att)" in script
+        assert ", size:attSize" not in script
         assert ", size:(file size of att)" not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_attachments_properties_are_read_best_effort(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Regression: `MIME type of att` raises on some accounts. A failing
+        property used to abort the loop and leave an empty list ("0
+        attachments"). Each property must sit in its own try."""
+        mock_run.return_value = "[]"
+        connector.get_attachments("12345")
+        script = mock_run.call_args[0][0]
+        for prop in ("name of att", "MIME type of att", "file size of att",
+                     "downloaded of att"):
+            idx = script.index("(" + prop + ")")
+            assert "try" in script[max(0, idx - 60):idx]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_attachments_blank_mime_type_is_derived_from_name(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = (
+            '[{"name":"CV.pdf","mime_type":"","size":10,"downloaded":true},'
+            '{"name":"foto.jpg","mime_type":"image/jpeg","size":5,'
+            '"downloaded":true},'
+            '{"name":"raar.zzzz","size":1,"downloaded":true}]'
+        )
+        result = connector.get_attachments("12345")
+        assert [a["mime_type"] for a in result] == [
+            "application/pdf", "image/jpeg", "application/octet-stream",
+        ]
 
 
 class TestSaveAttachments:
@@ -519,3 +552,86 @@ class TestGetAttachmentContent:
         ]
         with pytest.raises(MailAttachmentIndexError):
             connector.get_attachment_content("12345", 5)
+
+
+class TestSaveMessage:
+    """save_message: raw .eml export over IMAP."""
+
+    RAW = (
+        b"From: a@example.invalid\r\nTo: b@example.invalid\r\n"
+        b"Subject: Offerte: Q4 / 2026\r\nMessage-ID: <m@x>\r\n\r\nHallo\r\n"
+    )
+
+    @pytest.fixture
+    def connector(self):
+        from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+        return AppleMailConnector(timeout=5)
+
+    def _run(self, connector, tmp_path, raw=None, **kwargs):
+        import contextlib
+        from unittest.mock import MagicMock, patch
+
+        from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+        mock_imap = MagicMock()
+        mock_imap.fetch_raw_message.return_value = raw or self.RAW
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch(
+                "apple_mail_fast_mcp.mail_connector.ImapConnector",
+                return_value=mock_imap))
+            stack.enter_context(patch.object(
+                AppleMailConnector, "_get_imap_password_with_fallback",
+                return_value="pw"))
+            stack.enter_context(patch.object(
+                AppleMailConnector, "_resolve_imap_config",
+                return_value=("h", 993, "me@example.invalid")))
+            result = connector.save_message(
+                "<m@x>", tmp_path, account="A", mailbox="INBOX", **kwargs)
+        return result, mock_imap
+
+    def test_writes_raw_bytes_named_after_subject(self, connector, tmp_path):
+        result, mock_imap = self._run(connector, tmp_path)
+        written = Path(result["path"])
+        assert written.read_bytes() == self.RAW
+        assert written.suffix == ".eml"
+        assert written.parent == tmp_path.resolve()
+        assert "/" not in written.name
+        assert result["size"] == len(self.RAW)
+        mock_imap.fetch_raw_message.assert_called_once_with("<m@x>", "INBOX")
+
+    def test_existing_file_is_not_overwritten(self, connector, tmp_path):
+        first, _ = self._run(connector, tmp_path)
+        second, _ = self._run(connector, tmp_path)
+        assert first["path"] != second["path"]
+        assert Path(first["path"]).exists() and Path(second["path"]).exists()
+        assert second["name"].endswith("-2.eml")
+
+    def test_custom_filename_gets_eml_once(self, connector, tmp_path):
+        result, _ = self._run(connector, tmp_path, filename="mail.eml")
+        assert result["name"] == "mail.eml"
+
+    def test_hostile_filename_stays_inside_directory(self, connector, tmp_path):
+        result, _ = self._run(connector, tmp_path, filename="../../evil")
+        assert Path(result["path"]).parent == tmp_path.resolve()
+
+    def test_missing_directory_raises(self, connector, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            connector.save_message(
+                "<m@x>", tmp_path / "nope", account="A", mailbox="INBOX")
+
+    def test_oversize_message_rejected(self, connector, tmp_path):
+        from apple_mail_fast_mcp.exceptions import MailAttachmentTooLargeError
+        connector.max_total_attachment_bytes = 10
+        with pytest.raises(MailAttachmentTooLargeError):
+            self._run(connector, tmp_path)
+
+    def test_imap_unavailable_is_an_error_not_a_fallback(self, connector, tmp_path):
+        from unittest.mock import patch
+
+        from apple_mail_fast_mcp.mail_connector import _IMAP_FALLBACK_EXCS, AppleMailConnector
+        with patch.object(
+            AppleMailConnector, "_resolve_imap_config",
+            side_effect=_IMAP_FALLBACK_EXCS[0]("boom"),
+        ):
+            with pytest.raises(RuntimeError, match="IMAP"):
+                connector.save_message(
+                    "<m@x>", tmp_path, account="A", mailbox="INBOX")

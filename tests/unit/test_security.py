@@ -227,7 +227,7 @@ class TestCheckRateLimit:
     def test_all_operations_have_tier_assigned(self) -> None:
         expected_ops = {
             "list_accounts", "list_rules", "list_mailboxes", "get_messages",
-            "get_thread", "save_attachments", "get_attachment_content",
+            "get_thread", "save_attachments", "save_message", "get_attachment_content",
             "search_messages", "get_statistics",
             "update_message", "create_mailbox", "update_mailbox",
             "delete_mailbox", "delete_messages",

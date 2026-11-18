@@ -57,6 +57,7 @@ ADDITIVE_TOOLS: set[str] = {
     "create_rule",
     "save_template",
     "save_attachments",
+    "save_message",
 }
 
 MUTATING_TOOLS = DESTRUCTIVE_TOOLS | ADDITIVE_TOOLS
@@ -65,6 +66,7 @@ MUTATING_TOOLS = DESTRUCTIVE_TOOLS | ADDITIVE_TOOLS
 NON_IDEMPOTENT_TOOLS: set[str] = {
     "create_draft",   # each call may create a new draft
     "create_rule",    # rules may be appended on each call
+    "save_message",   # an existing file is never overwritten (-2, -3 suffix)
 }
 
 
@@ -173,7 +175,7 @@ class TestProductionAnnotations:
         """No overlap between read-only and mutating sets; counts are 11 + 14."""
         assert READ_ONLY_TOOLS.isdisjoint(MUTATING_TOOLS)
         assert len(READ_ONLY_TOOLS) == 11
-        assert len(MUTATING_TOOLS) == 14
+        assert len(MUTATING_TOOLS) == 15
         assert DESTRUCTIVE_TOOLS.isdisjoint(ADDITIVE_TOOLS)
 
     @pytest.mark.parametrize("name", sorted(READ_ONLY_TOOLS))

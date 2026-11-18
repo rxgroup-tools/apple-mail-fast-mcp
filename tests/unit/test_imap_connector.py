@@ -3962,3 +3962,102 @@ class TestResolveAnchor:
         client.search.return_value = []
         conn = ImapConnector("h", 993, "e@x", "pw")
         assert conn.resolve_anchor("nope@x") is None
+
+
+
+class TestWhitespaceInMessageIds:
+    """Folded Message-ID headers arrive with leading space/tab; such ids used
+    to come back as ' <abc@host>' and then failed every follow-up lookup."""
+
+    def test_strip_brackets_removes_leading_whitespace(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _strip_brackets
+
+        assert _strip_brackets(" <abc@host>") == "abc@host"
+        assert _strip_brackets("\t<abc@host>") == "abc@host"
+        assert _strip_brackets("<abc@host> ") == "abc@host"
+        assert _strip_brackets("abc@host") == "abc@host"
+
+    def test_bracket_message_id_tolerates_outer_whitespace(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _bracket_message_id
+
+        assert _bracket_message_id("\t<abc@host>") == "<abc@host>"
+        assert _bracket_message_id(" abc@host") == "<abc@host>"
+
+    def test_bracket_message_id_still_rejects_inner_control_chars(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _bracket_message_id
+
+        with pytest.raises(ValueError):
+            _bracket_message_id("abc@host\r\nA1 LOGOUT")
+        with pytest.raises(ValueError):
+            _bracket_message_id("abc\t@host")
+
+
+class TestSelectFolderNamespaceFallback:
+    """Dovecot-style servers want 'INBOX.Drafts', callers say 'Drafts'."""
+
+    def _client(self, accepted: set[str], message: str = "") -> Any:
+        from imapclient.exceptions import IMAPClientError
+
+        client = MagicMock()
+
+        def select(name: str, readonly: bool = False) -> dict[str, Any]:
+            if name in accepted:
+                return {b"EXISTS": 1}
+            raise IMAPClientError(
+                message
+                or "select failed: Client tried to access nonexistent "
+                "namespace. (Mailbox name should probably be prefixed "
+                "with: INBOX.)"
+            )
+
+        client.select_folder.side_effect = select
+        return client
+
+    def test_retries_with_prefix_from_server_hint(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _select_folder
+
+        client = self._client({"INBOX.Drafts"})
+        result = _select_folder(client, "Drafts", readonly=True)
+        assert result == {b"EXISTS": 1}
+        assert [c.args[0] for c in client.select_folder.call_args_list] == [
+            "Drafts", "INBOX.Drafts",
+        ]
+
+    def test_falls_back_to_inbox_dot_without_hint(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _select_folder
+
+        client = self._client(
+            {"INBOX.Sent"}, message="select failed: Mailbox does not exist"
+        )
+        assert _select_folder(client, "Sent", readonly=True)
+
+    def test_plain_name_that_works_is_not_retried(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _select_folder
+
+        client = self._client({"Archive"})
+        _select_folder(client, "Archive", readonly=True)
+        assert client.select_folder.call_count == 1
+
+    def test_inbox_and_unrelated_errors_propagate(self) -> None:
+        from imapclient.exceptions import IMAPClientError
+
+        from apple_mail_fast_mcp.imap_connector import _select_folder
+
+        client = self._client(set())
+        with pytest.raises(IMAPClientError):
+            _select_folder(client, "INBOX", readonly=True)
+        assert client.select_folder.call_count == 1
+
+        client = self._client(set(), message="select failed: Permission denied")
+        with pytest.raises(IMAPClientError):
+            _select_folder(client, "Drafts", readonly=True)
+        assert client.select_folder.call_count == 1
+
+    def test_raises_original_error_when_no_candidate_exists(self) -> None:
+        from imapclient.exceptions import IMAPClientError
+
+        from apple_mail_fast_mcp.imap_connector import _select_folder
+
+        client = self._client(set())
+        with pytest.raises(IMAPClientError):
+            _select_folder(client, "Nope", readonly=False)
