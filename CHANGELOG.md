@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0-rx3] - 2026-11-18 (RX Group build, package version 0.11.0.post7)
+
+### Added
+
+- **`update_message(answered=...)`:** sets or clears the IMAP `\Answered` flag (the reply arrow in Mail) on the original message. Mail does not set it for replies made as drafts over IMAP, so Claude sets it after the user has sent the reply. Needs `account` and `source_mailbox`, works over IMAP only (`imap_required` otherwise) and cannot be combined with the other fields.
+
 ## [0.11.0-rx2] - 2026-11-18 (RX Group build, package version 0.11.0.post6)
 
 Fork-specific changes on top of upstream 0.11.0. The tool surface grows from 25 to 26 tools.
