@@ -4061,3 +4061,54 @@ class TestSelectFolderNamespaceFallback:
         client = self._client(set())
         with pytest.raises(IMAPClientError):
             _select_folder(client, "Nope", readonly=False)
+
+
+class TestImapSetAnsweredStatus:
+    """The \\Answered flag (Mail's reply arrow) via UID STORE."""
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_true_adds_answered_flag(self, mock_cls: MagicMock) -> None:
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = [201]
+
+        marked = ImapConnector("h", 993, "u@e.com", "pw").set_answered_status(
+            ["a@example.com"], source_mailbox="INBOX", answered=True
+        )
+
+        assert marked == 1
+        client.select_folder.assert_called_once_with("INBOX", readonly=False)
+        client.add_flags.assert_called_once_with(
+            [201], [b"\\Answered"], silent=True
+        )
+        client.remove_flags.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_false_removes_answered_flag(self, mock_cls: MagicMock) -> None:
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = [201]
+
+        ImapConnector("h", 993, "u@e.com", "pw").set_answered_status(
+            ["a@example.com"], source_mailbox="INBOX", answered=False
+        )
+
+        client.remove_flags.assert_called_once_with(
+            [201], [b"\\Answered"], silent=True
+        )
+        client.add_flags.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_returns_zero_when_nothing_resolves(
+        self, mock_cls: MagicMock
+    ) -> None:
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = []
+
+        marked = ImapConnector("h", 993, "u@e.com", "pw").set_answered_status(
+            ["a@example.com"], source_mailbox="INBOX", answered=True
+        )
+
+        assert marked == 0
+        client.add_flags.assert_not_called()

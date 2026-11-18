@@ -4935,3 +4935,71 @@ class TestCreateDraftAttachFromMessage:
         })
         assert result["success"] is False
         staged.create_draft.assert_not_called()
+
+
+class TestUpdateMessageAnswered:
+    """update_message(answered=...) sets the reply arrow over IMAP."""
+
+    def test_answered_routes_to_set_answered_status(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail.set_answered_status.return_value = 1
+
+        result = update_message(
+            [" <a@x>\t"], answered=True, account="UUID", source_mailbox="INBOX"
+        )
+
+        assert result["success"] is True and result["updated"] == 1
+        mock_mail.set_answered_status.assert_called_once_with(
+            ["<a@x>"], account="UUID", source_mailbox="INBOX", answered=True
+        )
+        mock_mail.update_message.assert_not_called()
+
+    def test_answered_needs_account_and_source_mailbox(
+        self, mock_mail: MagicMock
+    ) -> None:
+        result = update_message(["a@x"], answered=True)
+
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        mock_mail.set_answered_status.assert_not_called()
+
+    def test_answered_cannot_be_combined(self, mock_mail: MagicMock) -> None:
+        result = update_message(
+            ["a@x"],
+            answered=True,
+            read_status=True,
+            account="UUID",
+            source_mailbox="INBOX",
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        mock_mail.set_answered_status.assert_not_called()
+        mock_mail.update_message.assert_not_called()
+
+    def test_answered_zero_updated_is_message_not_found(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail.set_answered_status.return_value = 0
+
+        result = update_message(
+            ["a@x"], answered=True, account="UUID", source_mailbox="INBOX"
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "message_not_found"
+
+    def test_answered_without_imap_is_imap_required(
+        self, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_fast_mcp.exceptions import MailImapRequiredError
+
+        mock_mail.set_answered_status.side_effect = MailImapRequiredError("no imap")
+
+        result = update_message(
+            ["a@x"], answered=True, account="UUID", source_mailbox="INBOX"
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "imap_required"

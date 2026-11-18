@@ -10220,3 +10220,64 @@ class TestImapOverridesResolveByNameOrUuid:
             _, port, _ = connector._resolve_imap_config("UUID-1234")
         assert port == 143
         alt.assert_not_called()
+
+
+class TestSetAnsweredStatus:
+    """AppleMailConnector.set_answered_status: IMAP only, fails loudly."""
+
+    @patch.object(AppleMailConnector, "_imap_set_answered_status")
+    def test_happy_path(self, mock_imap: MagicMock) -> None:
+        mock_imap.return_value = 2
+        conn = AppleMailConnector()
+
+        result = conn.set_answered_status(
+            ["a@x", "b@x"], account="UUID", source_mailbox="INBOX", answered=True
+        )
+
+        assert result == 2
+        mock_imap.assert_called_once_with(
+            account="UUID",
+            message_ids=["a@x", "b@x"],
+            source_mailbox="INBOX",
+            answered=True,
+        )
+
+    @patch.object(AppleMailConnector, "_imap_set_answered_status")
+    def test_imap_unavailable_raises_imap_required(
+        self, mock_imap: MagicMock
+    ) -> None:
+        from apple_mail_fast_mcp.exceptions import (
+            MailImapRequiredError,
+            MailKeychainEntryNotFoundError,
+        )
+
+        mock_imap.side_effect = MailKeychainEntryNotFoundError("no entry")
+
+        with pytest.raises(MailImapRequiredError):
+            AppleMailConnector().set_answered_status(
+                ["a@x"], account="UUID", source_mailbox="INBOX", answered=True
+            )
+
+    @patch("apple_mail_fast_mcp.mail_connector.ImapConnector")
+    @patch("apple_mail_fast_mcp.mail_connector.get_imap_password")
+    @patch.object(AppleMailConnector, "_resolve_imap_config")
+    def test_delegates_to_imap_connector(
+        self,
+        mock_resolve: MagicMock,
+        mock_keychain: MagicMock,
+        mock_imap_cls: MagicMock,
+    ) -> None:
+        mock_resolve.return_value = ("imap.x", 993, "u@x.com")
+        mock_keychain.return_value = "pw"
+        mock_imap = MagicMock()
+        mock_imap_cls.return_value = mock_imap
+        mock_imap.set_answered_status.return_value = 1
+
+        result = AppleMailConnector().set_answered_status(
+            ["a@x"], account="UUID", source_mailbox="INBOX", answered=False
+        )
+
+        assert result == 1
+        mock_imap.set_answered_status.assert_called_once_with(
+            message_ids=["a@x"], source_mailbox="INBOX", answered=False
+        )
