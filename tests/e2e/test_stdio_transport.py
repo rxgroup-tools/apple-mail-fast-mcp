@@ -40,6 +40,7 @@ EXPECTED_TOOLS = {
     # Mutations
     "update_message",
     "save_attachments",
+    "save_message",
     "get_attachment_content",
     "create_mailbox",
     "update_mailbox",

@@ -39,6 +39,7 @@ EXPECTED_TOOLS = {
     # Mutations
     "update_message",
     "save_attachments",
+    "save_message",
     "create_mailbox",
     "update_mailbox",
     "delete_mailbox",
@@ -190,6 +191,13 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
         {"message_id": "msg-1", "save_directory": _TMP_DIR},
         "save_attachments",
         {"saved": 0, "rejected": []},
+    ),
+    (
+        "save_message",
+        {"message_id": "msg-1", "save_directory": _TMP_DIR,
+         "account": "TestAccount", "mailbox": "INBOX"},
+        "save_message",
+        {"path": "/tmp/x.eml", "name": "x.eml", "size": 1},
     ),
     (
         "create_mailbox",
