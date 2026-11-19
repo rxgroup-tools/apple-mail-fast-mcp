@@ -4112,3 +4112,106 @@ class TestImapSetAnsweredStatus:
 
         assert marked == 0
         client.add_flags.assert_not_called()
+
+
+
+class TestImapSyncAnswered:
+    """sync_answered: flag mail that recent Sent messages replied to."""
+
+    @staticmethod
+    def _client(mock_cls: MagicMock, search_map: dict[str, list[int]]) -> MagicMock:
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.list_folders.return_value = [
+            ([b"\\HasNoChildren"], b".", "INBOX"),
+            ([b"\\HasNoChildren", b"\\Sent"], b".", "Sent"),
+            ([b"\\HasNoChildren", b"\\Drafts"], b".", "Drafts"),
+            ([b"\\HasNoChildren"], b".", "Archive"),
+            ([b"\\HasNoChildren"], b".", "Junk"),
+        ]
+        selected: list[str] = []
+
+        def _select(name: str, readonly: bool = False) -> dict[str, int]:
+            selected.append(name)
+            return {}
+
+        def _search(criteria: list) -> list[int]:
+            if criteria[0] == "SINCE":
+                return [1, 2]
+            return search_map.get(selected[-1], [])
+
+        client.select_folder.side_effect = _select
+        client.search.side_effect = _search
+        client.fetch.return_value = {
+            1: {b"BODY[HEADER.FIELDS (IN-REPLY-TO)]": b"In-Reply-To: <a@x.nl>\r\n\r\n"},
+            2: {b"BODY[HEADER.FIELDS (IN-REPLY-TO)]": b"Subject: no reply\r\n\r\n"},
+        }
+        return client
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_flags_replied_mail_in_inbox_and_archive(
+        self, mock_cls: MagicMock
+    ) -> None:
+        client = self._client(mock_cls, {"INBOX": [11], "Archive": [21, 22]})
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered(
+            since_days=3
+        )
+
+        assert result["replies_found"] == 1
+        assert result["sent_mailboxes"] == ["Sent"]
+        assert result["flagged"] == {"INBOX": 1, "Archive": 2}
+        assert client.add_flags.call_count == 2
+        client.add_flags.assert_any_call([11], [b"\\Answered"], silent=True)
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_skips_sent_drafts_and_junk_as_targets(
+        self, mock_cls: MagicMock
+    ) -> None:
+        client = self._client(mock_cls, {})
+
+        ImapConnector("h", 993, "u@e.com", "pw").sync_answered()
+
+        selected = [c.args[0] for c in client.select_folder.call_args_list]
+        assert selected == ["Sent", "INBOX", "Archive"]
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_only_unanswered_mail_is_searched(self, mock_cls: MagicMock) -> None:
+        client = self._client(mock_cls, {})
+
+        ImapConnector("h", 993, "u@e.com", "pw").sync_answered()
+
+        lookups = [
+            c.args[0] for c in client.search.call_args_list
+            if c.args[0][0] != "SINCE"
+        ]
+        assert lookups and all(crit[0] == "UNANSWERED" for crit in lookups)
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_dry_run_changes_nothing(self, mock_cls: MagicMock) -> None:
+        client = self._client(mock_cls, {"INBOX": [11]})
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered(
+            dry_run=True
+        )
+
+        assert result["flagged"] == {"INBOX": 1}
+        assert result["dry_run"] is True
+        client.add_flags.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_no_replies_means_no_target_searches(self, mock_cls: MagicMock) -> None:
+        client = self._client(mock_cls, {})
+        client.fetch.return_value = {
+            1: {b"BODY[HEADER.FIELDS (IN-REPLY-TO)]": b"\r\n"},
+        }
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered()
+
+        assert result["replies_found"] == 0
+        assert result["flagged"] == {}
+        client.add_flags.assert_not_called()
+
+    def test_rejects_out_of_range_window(self) -> None:
+        with pytest.raises(ValueError):
+            ImapConnector("h", 993, "u@e.com", "pw").sync_answered(since_days=0)

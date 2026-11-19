@@ -8,7 +8,11 @@ from unittest.mock import MagicMock
 import pytest
 from imapclient.exceptions import IMAPClientError, LoginError
 
-from apple_mail_fast_mcp.cli import run_setup_imap
+from apple_mail_fast_mcp.cli import (
+    run_install_sync_answered,
+    run_setup_imap,
+    run_sync_answered,
+)
 from apple_mail_fast_mcp.exceptions import (
     MailKeychainAccessDeniedError,
     MailKeychainEntryNotFoundError,
@@ -1024,3 +1028,155 @@ class TestSetupImapArgParsing:
         assert rc == 0
         assert calls["cli_host"] == "imap.h"
         assert calls["cli_port"] == 993
+
+
+
+class TestRunSyncAnswered:
+    """sync-answered subcommand: per-account loop for a scheduled job."""
+
+    def test_explicit_coordinates_never_touch_mail_app(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(
+            "apple_mail_fast_mcp.cli.get_imap_password", lambda a, e: "pw"
+        )
+        imap = MagicMock()
+        imap.sync_answered.return_value = {
+            "sent_mailboxes": ["Sent"],
+            "replies_found": 2,
+            "flagged": {"INBOX": 2},
+            "skipped": {},
+            "dry_run": False,
+        }
+        factory = MagicMock(return_value=imap)
+        connector_factory = MagicMock()
+
+        code = run_sync_answered(
+            accounts=["Julian | RX Group"],
+            emails=["julian@rxgroup.nl"],
+            host="mail.example.nl",
+            port=993,
+            imap_factory=factory,
+            connector_factory=connector_factory,
+        )
+
+        assert code == 0
+        connector_factory.assert_not_called()
+        factory.assert_called_once_with(
+            "mail.example.nl", 993, "julian@rxgroup.nl", "pw"
+        )
+        assert "flagged 2" in capsys.readouterr().out
+
+    def test_one_failing_account_does_not_stop_the_others(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _password(account: str, email: str) -> str:
+            if account == "bad":
+                raise MailKeychainEntryNotFoundError("nope")
+            return "pw"
+
+        monkeypatch.setattr("apple_mail_fast_mcp.cli.get_imap_password", _password)
+        imap = MagicMock()
+        imap.sync_answered.return_value = {
+            "sent_mailboxes": ["Sent"], "replies_found": 0,
+            "flagged": {}, "skipped": {}, "dry_run": False,
+        }
+
+        code = run_sync_answered(
+            accounts=["bad", "good"],
+            emails=["b@x.nl", "g@x.nl"],
+            host="h",
+            port=993,
+            imap_factory=MagicMock(return_value=imap),
+        )
+
+        assert code == 1
+        imap.sync_answered.assert_called_once()
+
+    def test_email_count_must_match_account_count(self) -> None:
+        assert run_sync_answered(
+            accounts=["a", "b"], emails=["a@x.nl"], host="h", port=993
+        ) == 2
+
+
+
+class TestRunInstallSyncAnswered:
+    """install-sync-answered: one launchd job per account."""
+
+    @staticmethod
+    def _env(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        exe = tmp_path / "apple-mail-fast-mcp"
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+        monkeypatch.setattr(
+            "apple_mail_fast_mcp.cli.get_imap_password", lambda a, e: "pw"
+        )
+        mail = MagicMock()
+        mail._resolve_imap_config.return_value = (
+            "mail.example.nl", 993, "me@example.nl"
+        )
+        launchctl = MagicMock()
+        launchctl.return_value = MagicMock(returncode=0, stderr="")
+        return {
+            "binary": str(exe),
+            "agents_dir": tmp_path / "agents",
+            "log_dir": tmp_path / "logs",
+            "launchctl": launchctl,
+            "connector_factory": lambda: mail,
+            "uid": 501,
+        }
+
+    def test_writes_one_plist_per_account_with_explicit_coordinates(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import plistlib
+
+        env = self._env(tmp_path, monkeypatch)
+
+        code = run_install_sync_answered(accounts=["Work | Main", "Home"], **env)
+
+        assert code == 0
+        plist = plistlib.loads(
+            (tmp_path / "agents" / "nl.rxgroup.mail-sync-answered.work-main.plist").read_bytes()
+        )
+        args = plist["ProgramArguments"]
+        assert args[1] == "sync-answered"
+        assert args[args.index("--account") + 1] == "Work | Main"
+        assert args[args.index("--host") + 1] == "mail.example.nl"
+        assert args[args.index("--port") + 1] == "993"
+        assert plist["StartInterval"] == 600
+        assert (tmp_path / "agents" / "nl.rxgroup.mail-sync-answered.home.plist").exists()
+        calls = [c.args[0][0] for c in env["launchctl"].call_args_list]
+        assert calls.count("bootstrap") == 2
+
+    def test_missing_keychain_entry_skips_that_account(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._env(tmp_path, monkeypatch)
+
+        def _password(account: str, email: str) -> str:
+            raise MailKeychainEntryNotFoundError("nope")
+
+        monkeypatch.setattr("apple_mail_fast_mcp.cli.get_imap_password", _password)
+
+        code = run_install_sync_answered(accounts=["A"], **env)
+
+        assert code == 1
+        assert not list((tmp_path / "agents").glob("*.plist"))
+
+    def test_uninstall_removes_jobs(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._env(tmp_path, monkeypatch)
+        run_install_sync_answered(accounts=["A", "B"], **env)
+
+        code = run_install_sync_answered(accounts=[], uninstall=True, **env)
+
+        assert code == 0
+        assert not list((tmp_path / "agents").glob("*.plist"))
+
+    def test_requires_an_account_when_installing(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._env(tmp_path, monkeypatch)
+        assert run_install_sync_answered(accounts=[], **env) == 2
