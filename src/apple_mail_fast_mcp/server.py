@@ -3936,6 +3936,70 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "fast path; AppleScript fallback continues to work)."
         ),
     )
+
+    sync = sub.add_parser(
+        "sync-answered",
+        help=(
+            "Set the reply arrow (IMAP \\Answered) on mail you have replied "
+            "to, based on the Sent mailbox. Meant to run on a schedule."
+        ),
+    )
+    sync.add_argument(
+        "--account",
+        action="append",
+        required=True,
+        help="Mail.app account name (repeat for several accounts).",
+    )
+    sync.add_argument(
+        "--email",
+        action="append",
+        default=None,
+        help=(
+            "IMAP login for the matching --account (same order). With "
+            "--host and --port the run never touches Mail.app."
+        ),
+    )
+    sync.add_argument("--host", default=None, help="IMAP host for all accounts.")
+    sync.add_argument(
+        "--port", type=_port_arg, default=None, help="IMAP port for all accounts."
+    )
+    sync.add_argument(
+        "--since-days",
+        type=int,
+        default=3,
+        help="How many days of Sent mail to inspect (default 3).",
+    )
+    sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only report what would be flagged.",
+    )
+
+    install_sync = sub.add_parser(
+        "install-sync-answered",
+        help=(
+            "Install a background job (macOS launchd) per account that runs "
+            "sync-answered every few minutes, so replies get the reply arrow "
+            "automatically."
+        ),
+    )
+    install_sync.add_argument(
+        "--account",
+        action="append",
+        default=[],
+        help="Mail.app account name (repeat for several accounts).",
+    )
+    install_sync.add_argument(
+        "--interval-minutes", type=int, default=10, help="Run interval (default 10)."
+    )
+    install_sync.add_argument(
+        "--since-days", type=int, default=3, help="Days of Sent mail to inspect."
+    )
+    install_sync.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove the job(s) again (all of them when no --account is given).",
+    )
     return parser
 
 
@@ -3958,6 +4022,28 @@ def main(argv: list[str] | None = None) -> int:
             uninstall=args.uninstall,
             cli_host=args.host,
             cli_port=args.port,
+        )
+
+    if args.command == "install-sync-answered":
+        from .cli import run_install_sync_answered
+
+        return run_install_sync_answered(
+            accounts=args.account,
+            interval_minutes=args.interval_minutes,
+            since_days=args.since_days,
+            uninstall=args.uninstall,
+        )
+
+    if args.command == "sync-answered":
+        from .cli import run_sync_answered
+
+        return run_sync_answered(
+            accounts=args.account,
+            emails=args.email,
+            host=args.host,
+            port=args.port,
+            since_days=args.since_days,
+            dry_run=args.dry_run,
         )
 
     if _READ_ONLY:

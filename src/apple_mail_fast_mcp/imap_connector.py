@@ -2069,6 +2069,144 @@ class ImapConnector:
                 client.remove_flags(uids, [b"\\Answered"], silent=True)
             return len(uids)
 
+    # Folder-name fragments (lowercase) that never hold mail Julian replies to.
+    _SYNC_SKIP_NAME_MARKERS = (
+        "sent", "verzonden", "draft", "concept", "trash", "deleted",
+        "prullenbak", "junk", "spam",
+    )
+    _SYNC_SKIP_FLAGS = (b"\\Sent", b"\\Drafts", b"\\Trash", b"\\Junk", b"\\Noselect")
+
+    def sync_answered(
+        self,
+        *,
+        since_days: int = 3,
+        sent_mailboxes: list[str] | None = None,
+        target_mailboxes: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Set \\Answered on every mail that a recently sent message replies to.
+
+        Reads the ``In-Reply-To`` header of everything in the Sent mailbox(es)
+        from the last ``since_days`` days, then looks those Message-IDs up in
+        the target mailboxes and flags the ones not yet \\Answered. Mail.app
+        only sets the reply arrow for replies composed in Mail itself; this
+        closes that gap for replies that started as an IMAP draft. Idempotent:
+        already-answered mail is never matched (``UNANSWERED`` in the search).
+
+        Args:
+            since_days: How far back to read Sent (1-365).
+            sent_mailboxes: Override the detected Sent mailbox(es).
+            target_mailboxes: Override the searched mailboxes. Default is
+                INBOX plus every selectable folder that is not Sent, Drafts,
+                Trash or Junk.
+            dry_run: Report what would be flagged without changing anything.
+
+        Returns:
+            ``{"sent_mailboxes", "replies_found", "flagged": {folder: n},
+            "skipped": {folder: reason}, "dry_run"}``.
+        """
+        if not 1 <= since_days <= 365:
+            raise ValueError(f"since_days must be 1-365, got {since_days}")
+        since = _date.today() - _timedelta(days=since_days)
+        since_str = f"{since.day:02d}-{_IMAP_MONTHS[since.month - 1]}-{since.year}"
+
+        flagged: dict[str, int] = {}
+        skipped: dict[str, str] = {}
+
+        with self._session() as client:
+            listing: list[tuple[list[bytes], str]] = []
+            for flags, _delim, name in client.list_folders():
+                decoded = (
+                    name.decode("utf-8", errors="replace")
+                    if isinstance(name, (bytes, bytearray))
+                    else cast(str, name)
+                )
+                listing.append((list(flags), decoded))
+
+            if sent_mailboxes is None:
+                sent_mailboxes = [n for f, n in listing if b"\\Sent" in f]
+                if not sent_mailboxes:
+                    present = {n for _f, n in listing}
+                    sent_mailboxes = [
+                        c for c in self._CONVENTIONAL_SENT_NAMES if c in present
+                    ]
+            for name in sent_mailboxes:
+                _reject_control_chars(name, "sent_mailbox")
+
+            reply_ids: list[str] = []
+            seen: set[str] = set()
+            for sent in sent_mailboxes:
+                try:
+                    _select_folder(client, sent, readonly=True)
+                    uids = client.search(["SINCE", since_str])
+                except IMAPClientError as exc:
+                    skipped[sent] = str(exc)
+                    continue
+                for i in range(0, len(uids), 200):
+                    fetched = client.fetch(
+                        uids[i:i + 200],
+                        [b"BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO)]"],
+                    )
+                    for entry in fetched.values():
+                        match = re.search(
+                            rb"<[^<>\s]+>", _header_fields_bytes(entry)
+                        )
+                        if not match:
+                            continue
+                        mid = match.group(0).decode("utf-8", errors="replace")
+                        try:
+                            mid = _bracket_message_id(mid)
+                        except ValueError:
+                            continue
+                        if mid not in seen:
+                            seen.add(mid)
+                            reply_ids.append(mid)
+
+            if target_mailboxes is None:
+                targets = ["INBOX"]
+                for flags, name in listing:
+                    lowered = name.lower()
+                    if name.upper() == "INBOX":
+                        continue
+                    if any(f in flags for f in self._SYNC_SKIP_FLAGS):
+                        continue
+                    if any(m in lowered for m in self._SYNC_SKIP_NAME_MARKERS):
+                        continue
+                    targets.append(name)
+            else:
+                targets = list(target_mailboxes)
+                for name in targets:
+                    _reject_control_chars(name, "target_mailbox")
+
+            if reply_ids:
+                for target in targets:
+                    try:
+                        _select_folder(client, target, readonly=dry_run)
+                    except IMAPClientError as exc:
+                        skipped[target] = str(exc)
+                        continue
+                    hits: list[int] = []
+                    for i in range(0, len(reply_ids), _MSGID_SEARCH_CHUNK):
+                        chunk = reply_ids[i:i + _MSGID_SEARCH_CHUNK]
+                        hits.extend(
+                            client.search(
+                                ["UNANSWERED", _or_message_id_criteria(chunk)]
+                            )
+                        )
+                    hits = list(dict.fromkeys(hits))
+                    if hits:
+                        if not dry_run:
+                            client.add_flags(hits, [_FLAG_ANSWERED], silent=True)
+                        flagged[target] = len(hits)
+
+        return {
+            "sent_mailboxes": list(sent_mailboxes),
+            "replies_found": len(reply_ids),
+            "flagged": flagged,
+            "skipped": skipped,
+            "dry_run": dry_run,
+        }
+
     @staticmethod
     def _has_capability(client: IMAPClient, name: bytes) -> bool:
         """True if ``name`` (e.g. ``b"X-GM-EXT-1"``) is in the post-login

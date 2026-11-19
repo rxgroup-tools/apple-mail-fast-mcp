@@ -8,9 +8,14 @@ invocation (no subcommand) starts the MCP server — that path lives in
 from __future__ import annotations
 
 import getpass
+import os
+import plistlib
+import re
+import subprocess
 import sys
 import webbrowser
 from collections.abc import Callable
+from pathlib import Path
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
@@ -331,4 +336,199 @@ def run_setup_imap(
     )
 
 
-__all__ = ["run_setup_imap", "get_imap_password"]
+def run_sync_answered(
+    *,
+    accounts: list[str],
+    emails: list[str] | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    since_days: int = 3,
+    dry_run: bool = False,
+    connector_factory: Callable[[], AppleMailConnector] | None = None,
+    imap_factory: Callable[[str, int, str, str], ImapConnector] | None = None,
+) -> int:
+    """Run the ``sync-answered`` subcommand (meant for a scheduled job).
+
+    For each account: read the recent Sent mail, and set \\Answered (Mail's
+    reply arrow) on the mails those messages replied to. When ``emails`` and
+    ``host``/``port`` are given the run never talks to Mail.app (no
+    AppleScript), which is what a launchd job needs; otherwise the IMAP
+    coordinates are resolved through Mail.app like the MCP server does.
+    Returns 0 when every account succeeded, 1 otherwise.
+    """
+    if emails and len(emails) != len(accounts):
+        print(
+            "ERROR: pass one --email per --account (same order), or none.",
+            file=sys.stderr,
+        )
+        return 2
+    factory = imap_factory or ImapConnector
+    mail: AppleMailConnector | None = None
+    exit_code = 0
+    for index, account in enumerate(accounts):
+        try:
+            if emails and host and port:
+                email = emails[index]
+                imap_host, imap_port = host, port
+            else:
+                if mail is None:
+                    mail = (connector_factory or AppleMailConnector)()
+                imap_host, imap_port, resolved = mail._resolve_imap_config(account)
+                email = emails[index] if emails else resolved
+                imap_host = host or imap_host
+                imap_port = port or imap_port
+            password = get_imap_password(account, email)
+            result = factory(imap_host, imap_port, email, password).sync_answered(
+                since_days=since_days, dry_run=dry_run
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad account must not stop the rest
+            print(f"{account}: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+        label = "would flag" if dry_run else "flagged"
+        total = sum(result["flagged"].values())
+        detail = ", ".join(f"{k}={v}" for k, v in result["flagged"].items()) or "-"
+        print(
+            f"{account}: {result['replies_found']} replies in "
+            f"{'/'.join(result['sent_mailboxes']) or '?'}; {label} {total} ({detail})"
+        )
+        for folder, reason in result["skipped"].items():
+            print(f"  skipped {folder}: {reason}", file=sys.stderr)
+    return exit_code
+
+
+_JOB_LABEL_PREFIX = "nl.rxgroup.mail-sync-answered"
+
+
+def _job_label(account: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", account.lower()).strip("-") or "account"
+    return f"{_JOB_LABEL_PREFIX}.{slug}"
+
+
+def _default_launchctl(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["launchctl", *args], capture_output=True, text=True, check=False
+    )
+
+
+def run_install_sync_answered(
+    *,
+    accounts: list[str],
+    interval_minutes: int = 10,
+    since_days: int = 3,
+    uninstall: bool = False,
+    connector_factory: Callable[[], AppleMailConnector] | None = None,
+    binary: str | None = None,
+    agents_dir: Path | None = None,
+    log_dir: Path | None = None,
+    launchctl: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+    uid: int | None = None,
+) -> int:
+    """Install (or remove) one launchd job per account that runs
+    ``sync-answered`` every ``interval_minutes`` minutes.
+
+    Run it in Terminal: the IMAP host, port and login are resolved through
+    Mail.app *now* and written into the job, so the background job itself
+    never needs Mail.app or AppleScript access. Returns 0 on success.
+    """
+    if launchctl is None and sys.platform != "darwin":
+        print("ERROR: launchd jobs only exist on macOS.", file=sys.stderr)
+        return 1
+    if not 1 <= interval_minutes <= 1440:
+        print("ERROR: --interval-minutes must be 1-1440.", file=sys.stderr)
+        return 2
+    run_launchctl = launchctl or _default_launchctl
+    agents = agents_dir or Path.home() / "Library" / "LaunchAgents"
+    logs = log_dir or Path.home() / "Library" / "Logs"
+    domain = f"gui/{uid if uid is not None else os.getuid()}"
+
+    if uninstall:
+        if accounts:
+            plists = [agents / f"{_job_label(a)}.plist" for a in accounts]
+        else:
+            plists = sorted(agents.glob(f"{_JOB_LABEL_PREFIX}.*.plist"))
+        removed = 0
+        for plist in plists:
+            if not plist.exists():
+                continue
+            run_launchctl(["bootout", f"{domain}/{plist.stem}"])
+            plist.unlink()
+            removed += 1
+            print(f"Removed {plist.stem}")
+        if removed == 0:
+            print("No sync-answered jobs found.")
+        return 0
+
+    if not accounts:
+        print("ERROR: pass at least one --account.", file=sys.stderr)
+        return 2
+    exe = Path(binary or sys.argv[0]).resolve()
+    if not exe.is_file() or not os.access(exe, os.X_OK):
+        print(f"ERROR: cannot find the apple-mail-fast-mcp program at {exe}.",
+              file=sys.stderr)
+        return 1
+
+    mail = (connector_factory or AppleMailConnector)()
+    agents.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    exit_code = 0
+    for account in accounts:
+        try:
+            host, port, email = mail._resolve_imap_config(account)
+            get_imap_password(account, email)
+        except MailKeychainEntryNotFoundError:
+            print(
+                f"{account}: no password in the Keychain yet. Run "
+                f"`apple-mail-fast-mcp setup-imap --account \"{account}\" "
+                f"--port {993}` first.",
+                file=sys.stderr,
+            )
+            exit_code = 1
+            continue
+        except Exception as exc:  # noqa: BLE001 - report per account, continue
+            print(f"{account}: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+        label = _job_label(account)
+        plist_path = agents / f"{label}.plist"
+        plist_path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": label,
+                    "ProgramArguments": [
+                        str(exe), "sync-answered",
+                        "--account", account,
+                        "--email", email,
+                        "--host", host,
+                        "--port", str(port),
+                        "--since-days", str(since_days),
+                    ],
+                    "StartInterval": interval_minutes * 60,
+                    "RunAtLoad": True,
+                    "StandardOutPath": str(logs / "mail-sync-answered.log"),
+                    "StandardErrorPath": str(logs / "mail-sync-answered.log"),
+                }
+            )
+        )
+        run_launchctl(["bootout", f"{domain}/{label}"])
+        result = run_launchctl(["bootstrap", domain, str(plist_path)])
+        if result.returncode != 0:
+            print(
+                f"{account}: launchctl failed: {result.stderr.strip()}",
+                file=sys.stderr,
+            )
+            exit_code = 1
+            continue
+        print(
+            f"{account}: installed, runs every {interval_minutes} minutes "
+            f"(log: {logs / 'mail-sync-answered.log'})"
+        )
+    return exit_code
+
+
+__all__ = [
+    "run_setup_imap",
+    "run_sync_answered",
+    "run_install_sync_answered",
+    "get_imap_password",
+]
