@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0-rx4] - 2026-11-18 (RX Group build, package version 0.11.0.post9)
+
+### Added
+
+- `apple-mail-fast-mcp sync-answered`: scheduled-job command that reads the
+  `In-Reply-To` headers of recent Sent mail and sets `\Answered` (Mail's reply
+  arrow) on the mails replied to, in INBOX and the other folders. Idempotent,
+  supports `--dry-run`, and with `--email/--host/--port` never talks to Mail.app.
+
+- `apple-mail-fast-mcp install-sync-answered --account NAME [--account ...]`:
+  installs one macOS launchd job per account that runs `sync-answered` every
+  10 minutes (IMAP host/port/login resolved at install time, so the job never
+  needs Mail.app access). `--uninstall` removes the jobs again.
+
 ## [0.11.0-rx3] - 2026-11-18 (RX Group build, package version 0.11.0.post7)
 
 ### Added
