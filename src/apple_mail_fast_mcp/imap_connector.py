@@ -34,6 +34,7 @@ from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
+from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any, cast
 
 from imapclient import DRAFT, IMAPClient
@@ -874,6 +875,34 @@ def _header_fields_bytes(entry: dict[bytes, Any]) -> bytes:
         ):
             return bytes(value)
     return b""
+
+
+_SUBJECT_PREFIX_RE = re.compile(
+    r"^\s*(re|aw|antw|sv|fwd|fw|doorst|wg)\s*(\[\d+\])?\s*:\s*", re.IGNORECASE
+)
+_REPLY_PREFIXES = {"re", "aw", "antw", "sv"}
+
+
+def _subject_core(subject: str) -> tuple[bool, str]:
+    """Split a subject into (is_reply, normalised core).
+
+    ``is_reply`` is True only when the subject starts with a reply prefix
+    (Re/AW/Antw/SV); forwards (Fwd/FW/Doorst) are never replies. The core has
+    every leading prefix stripped, whitespace collapsed and is casefolded, so
+    ``"RE: RE: Re: Voorstel"`` and ``"Voorstel"`` compare equal.
+    """
+    is_reply = False
+    first = True
+    rest = subject or ""
+    while True:
+        match = _SUBJECT_PREFIX_RE.match(rest)
+        if not match:
+            break
+        if first:
+            is_reply = match.group(1).lower() in _REPLY_PREFIXES
+            first = False
+        rest = rest[match.end():]
+    return is_reply, " ".join(rest.split()).casefold()
 
 
 def _anchor_from_fetch(entry: dict[bytes, Any]) -> dict[str, Any]:
@@ -2088,7 +2117,11 @@ class ImapConnector:
 
         Reads the ``In-Reply-To`` header of everything in the Sent mailbox(es)
         from the last ``since_days`` days, then looks those Message-IDs up in
-        the target mailboxes and flags the ones not yet \\Answered. Mail.app
+        the target mailboxes and flags the ones not yet \\Answered. A sent
+        reply without any Message-ID reference (Mail drops it when an IMAP
+        draft is edited and sent) falls back to matching an unanswered mail
+        from one of its recipients with the same subject, received before
+        the reply (forwards never match). Mail.app
         only sets the reply arrow for replies composed in Mail itself; this
         closes that gap for replies that started as an IMAP draft. Idempotent:
         already-answered mail is never matched (``UNANSWERED`` in the search).
@@ -2135,6 +2168,7 @@ class ImapConnector:
 
             reply_ids: list[str] = []
             seen: set[str] = set()
+            fallback: list[tuple[str, set[str], _datetime]] = []
             for sent in sent_mailboxes:
                 try:
                     _select_folder(client, sent, readonly=True)
@@ -2145,22 +2179,58 @@ class ImapConnector:
                 for i in range(0, len(uids), 200):
                     fetched = client.fetch(
                         uids[i:i + 200],
-                        [b"BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO)]"],
+                        [
+                            b"BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES "
+                            b"SUBJECT TO CC DATE)]"
+                        ],
                     )
                     for entry in fetched.values():
-                        match = re.search(
-                            rb"<[^<>\s]+>", _header_fields_bytes(entry)
-                        )
+                        raw = _header_fields_bytes(entry)
+                        parsed = message_from_bytes(raw, policy=policy.default)
+                        in_reply = str(parsed.get("In-Reply-To") or "")
+                        refs = str(parsed.get("References") or "")
+                        match = re.search(r"<[^<>\s]+>", in_reply)
                         if not match:
+                            ref_ids = re.findall(r"<[^<>\s]+>", refs)
+                            match = (
+                                re.search(r"<[^<>\s]+>", ref_ids[-1])
+                                if ref_ids
+                                else None
+                            )
+                        if match:
+                            try:
+                                mid = _bracket_message_id(match.group(0))
+                            except ValueError:
+                                continue
+                            if mid not in seen:
+                                seen.add(mid)
+                                reply_ids.append(mid)
                             continue
-                        mid = match.group(0).decode("utf-8", errors="replace")
+                        # No Message-ID reference (Mail drops it when a draft
+                        # made over IMAP is edited and sent): fall back to
+                        # subject + recipient + date, replies only.
+                        is_reply, core = _subject_core(
+                            str(parsed.get("Subject") or "")
+                        )
+                        if not is_reply or not core:
+                            continue
+                        addrs = {
+                            addr.lower()
+                            for _n, addr in getaddresses(
+                                [str(v) for v in parsed.get_all("To", [])]
+                                + [str(v) for v in parsed.get_all("Cc", [])]
+                            )
+                            if addr and "@" in addr
+                        }
                         try:
-                            mid = _bracket_message_id(mid)
-                        except ValueError:
+                            sent_dt = parsedate_to_datetime(
+                                str(parsed.get("Date") or "")
+                            )
+                            sent_naive = sent_dt.astimezone().replace(tzinfo=None)
+                        except (TypeError, ValueError):
                             continue
-                        if mid not in seen:
-                            seen.add(mid)
-                            reply_ids.append(mid)
+                        if addrs:
+                            fallback.append((core, addrs, sent_naive))
 
             if target_mailboxes is None:
                 targets = ["INBOX"]
@@ -2178,7 +2248,13 @@ class ImapConnector:
                 for name in targets:
                     _reject_control_chars(name, "target_mailbox")
 
-            if reply_ids:
+            orig_since = since - _timedelta(days=30)
+            orig_since_str = (
+                f"{orig_since.day:02d}-{_IMAP_MONTHS[orig_since.month - 1]}"
+                f"-{orig_since.year}"
+            )
+            fallback_hits = 0
+            if reply_ids or fallback:
                 for target in targets:
                     try:
                         _select_folder(client, target, readonly=dry_run)
@@ -2194,6 +2270,23 @@ class ImapConnector:
                             )
                         )
                     hits = list(dict.fromkeys(hits))
+                    by_sender: dict[str, dict[int, tuple[str, _datetime]]] = {}
+                    for core, addrs, sent_naive in fallback:
+                        for addr in addrs:
+                            if addr not in by_sender:
+                                by_sender[addr] = self._unanswered_from(
+                                    client, addr, orig_since_str
+                                )
+                            for uid, (subj_core, received) in by_sender[
+                                addr
+                            ].items():
+                                if (
+                                    subj_core == core
+                                    and received <= sent_naive
+                                    and uid not in hits
+                                ):
+                                    hits.append(uid)
+                                    fallback_hits += 1
                     if hits:
                         if not dry_run:
                             client.add_flags(hits, [_FLAG_ANSWERED], silent=True)
@@ -2201,11 +2294,38 @@ class ImapConnector:
 
         return {
             "sent_mailboxes": list(sent_mailboxes),
-            "replies_found": len(reply_ids),
+            "replies_found": len(reply_ids) + len(fallback),
+            "fallback_matches": fallback_hits,
             "flagged": flagged,
             "skipped": skipped,
             "dry_run": dry_run,
         }
+
+    @staticmethod
+    def _unanswered_from(
+        client: IMAPClient, addr: str, since_str: str
+    ) -> dict[int, tuple[str, _datetime]]:
+        """UNANSWERED mail from ``addr`` since ``since_str`` in the selected
+        folder, as ``{uid: (subject core, received naive-local datetime)}``."""
+        uids = client.search(["UNANSWERED", "FROM", addr, "SINCE", since_str])
+        found: dict[int, tuple[str, _datetime]] = {}
+        for i in range(0, len(uids), 100):
+            fetched = client.fetch(
+                uids[i:i + 100],
+                [b"BODY.PEEK[HEADER.FIELDS (SUBJECT)]", b"INTERNALDATE"],
+            )
+            for uid, entry in fetched.items():
+                parsed = message_from_bytes(
+                    _header_fields_bytes(entry), policy=policy.default
+                )
+                received = entry.get(b"INTERNALDATE")
+                if not isinstance(received, _datetime):
+                    continue
+                if received.tzinfo is not None:
+                    received = received.astimezone().replace(tzinfo=None)
+                _is_reply, core = _subject_core(str(parsed.get("Subject") or ""))
+                found[uid] = (core, received)
+        return found
 
     @staticmethod
     def _has_capability(client: IMAPClient, name: bytes) -> bool:
