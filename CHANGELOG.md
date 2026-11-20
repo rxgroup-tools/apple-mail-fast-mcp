@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0-rx5] - 2026-11-20 (RX Group build, package version 0.11.0.post10)
+
+### Fixed
+
+- `sync-answered`: a sent reply that has no `In-Reply-To`/`References` header
+  (Mail drops them when a draft made over IMAP is edited and sent) no longer
+  leaves the original without a reply arrow. Such a reply now falls back to
+  matching an unanswered mail from one of its recipients with the same subject
+  (Re/AW/Antw prefixes ignored), received before the reply. Forwards never
+  match. The result gains `fallback_matches`.
+
 ## [0.11.0-rx4] - 2026-11-18 (RX Group build, package version 0.11.0.post9)
 
 ### Added
