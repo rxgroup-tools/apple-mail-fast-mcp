@@ -4215,3 +4215,121 @@ class TestImapSyncAnswered:
     def test_rejects_out_of_range_window(self) -> None:
         with pytest.raises(ValueError):
             ImapConnector("h", 993, "u@e.com", "pw").sync_answered(since_days=0)
+
+
+class TestImapSyncAnsweredFallback:
+    """sync_answered: replies without In-Reply-To match on subject+recipient."""
+
+    @staticmethod
+    def _setup(
+        mock_cls: MagicMock,
+        sent_headers: bytes,
+        inbox_subject: bytes = b"Subject: Je sollicitatie\r\n\r\n",
+        inbox_received: Any = None,
+    ) -> MagicMock:
+
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.list_folders.return_value = [
+            ([b"\\HasNoChildren"], b".", "INBOX"),
+            ([b"\\HasNoChildren", b"\\Sent"], b".", "Sent"),
+        ]
+        selected: list[str] = []
+        client.select_folder.side_effect = lambda n, readonly=False: selected.append(n) or {}
+
+        def _search(criteria: list) -> list[int]:
+            if criteria[0] == "SINCE":
+                return [1]
+            if selected[-1] == "INBOX" and "FROM" in criteria:
+                return [50]
+            return []
+
+        def _fetch(uids: list[int], fields: list[bytes]) -> dict:
+            if selected[-1] == "Sent":
+                return {1: {b"BODY[HEADER.FIELDS (X)]": sent_headers}}
+            return {
+                50: {
+                    b"BODY[HEADER.FIELDS (SUBJECT)]": inbox_subject,
+                    b"INTERNALDATE": inbox_received
+                    or datetime(2026, 11, 19, 13, 23),
+                }
+            }
+
+        client.search.side_effect = _search
+        client.fetch.side_effect = _fetch
+        return client
+
+    SENT = (
+        b"Subject: Re: Je sollicitatie\r\n"
+        b"To: Mike <m@x.com>\r\n"
+        b"Date: Fri, 20 Nov 2026 08:03:17 +0100\r\n\r\n"
+    )
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_flags_by_subject_and_recipient(self, mock_cls: MagicMock) -> None:
+        client = self._setup(mock_cls, self.SENT)
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered()
+
+        assert result["fallback_matches"] == 1
+        assert result["flagged"] == {"INBOX": 1}
+        client.add_flags.assert_called_once_with([50], [b"\\Answered"], silent=True)
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_other_subject_is_not_flagged(self, mock_cls: MagicMock) -> None:
+        client = self._setup(
+            mock_cls, self.SENT, inbox_subject=b"Subject: Iets anders\r\n\r\n"
+        )
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered()
+
+        assert result["flagged"] == {}
+        client.add_flags.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_mail_received_after_the_reply_is_not_flagged(
+        self, mock_cls: MagicMock
+    ) -> None:
+
+        client = self._setup(
+            mock_cls, self.SENT, inbox_received=datetime(2026, 11, 21, 9, 0)
+        )
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered()
+
+        assert result["flagged"] == {}
+        client.add_flags.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_forward_is_never_a_reply(self, mock_cls: MagicMock) -> None:
+        sent = self.SENT.replace(b"Re: Je", b"Fwd: Je")
+        client = self._setup(mock_cls, sent)
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered()
+
+        assert result["flagged"] == {}
+        client.add_flags.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_dry_run_changes_nothing(self, mock_cls: MagicMock) -> None:
+        client = self._setup(mock_cls, self.SENT)
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").sync_answered(
+            dry_run=True
+        )
+
+        assert result["flagged"] == {"INBOX": 1}
+        client.add_flags.assert_not_called()
+
+
+class TestSubjectCore:
+    def test_strips_nested_prefixes(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _subject_core
+
+        assert _subject_core("RE: RE: Re: Voorstel  X") == (True, "voorstel x")
+
+    def test_forward_is_not_reply(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _subject_core
+
+        assert _subject_core("Fwd: Factuur")[0] is False
+        assert _subject_core("Factuur")[0] is False
