@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0-rx6] - 2026-11-22 (RX Group build, package version 0.11.0.post11)
+
+### Fixed
+
+- `update_message` with `flag_color` (and other AppleScript-path patches) failed
+  on every account but the first with "could not be checked at all". The
+  Message-ID to Mail-id lookup binary-searched Mail's unified inbox, which
+  concatenates the per-account lists instead of merging them by date. The
+  search now runs inside the account and folder IMAP found the message in
+  (`_locate_via_imap` returns the account). Mail's own mailbox names are tried
+  without the server's `INBOX.` prefix (`INBOX.Sent` becomes `Sent`). An
+  unresolvable folder raises a clear error.
+
 ## [0.11.0-rx5] - 2026-11-20 (RX Group build, package version 0.11.0.post10)
 
 ### Fixed
