@@ -5129,7 +5129,10 @@ class AppleMailConnector:
 
         # Stage 2: binary-search Mail by the date IMAP reported.
         return self._find_by_message_id_near_date(
-            rfc5322_message_id, cast(_datetime, located["internaldate"])
+            rfc5322_message_id,
+            cast(_datetime, located["internaldate"]),
+            account=cast("str | None", located.get("account")),
+            folder=cast("str | None", located.get("folder")),
         )
 
     def _locate_via_imap(self, rfc5322_message_id: str) -> dict[str, Any] | None:
@@ -5164,13 +5167,43 @@ class AppleMailConnector:
                 continue
             if found is not None:
                 self._imap_clear_breaker(account)
-                return found
+                # The account matters: Mail's unified inbox is NOT globally
+                # date-sorted across accounts (rx6), so the binary search must
+                # run inside the account (and folder) IMAP found it in.
+                return {**found, "account": account}
         if last_exc is not None:
             raise last_exc
         return None
 
+    @staticmethod
+    def _mailbox_name_candidates(folder: str) -> list[str]:
+        """Names Mail.app might use for an IMAP folder, most specific first.
+
+        IMAP says ``INBOX.Sent`` (dot delimiter) or ``INBOX/Sent``; Mail's
+        AppleScript path for the same mailbox is ``INBOX/Sent`` or just
+        ``Sent``. ``resolveMailbox`` matches a slash path or a bare name.
+        """
+        out: list[str] = []
+        # Servers that namespace everything under INBOX (Yourhosting:
+        # ``INBOX.Sent``, ``INBOX.AFWACHTEN.PRIORITEIT 1``) are shown by Mail
+        # WITHOUT that prefix (``Sent``, ``AFWACHTEN/PRIORITEIT 1``).
+        stripped = folder[len("INBOX."):] if folder.startswith("INBOX.") else folder
+        for cand in (
+            folder,
+            stripped.replace(".", "/") if "/" not in stripped else stripped,
+            folder.replace(".", "/") if "/" not in folder else folder,
+            folder.rsplit("/", 1)[-1].rsplit(".", 1)[-1],
+        ):
+            if cand and cand not in out:
+                out.append(cand)
+        return out
+
     def _find_by_message_id_near_date(
-        self, rfc5322_message_id: str, when: _datetime
+        self,
+        rfc5322_message_id: str,
+        when: _datetime,
+        account: str | None = None,
+        folder: str | None = None,
     ) -> str | None:
         """Binary-search Mail's unified mailboxes for a Message-ID known to
         have arrived around ``when``, and return Mail's internal id (#432).
@@ -5200,15 +5233,43 @@ class AppleMailConnector:
             when.day,
             when.hour * 3600 + when.minute * 60 + when.second,
         )
-        script = _wrap_with_timeout(
+        if account and folder:
+            # rx6: search the mailbox IMAP found the message in, inside ITS
+            # account. Mail's unified `inbox` concatenates the per-account
+            # lists (each newest-first) instead of merging them, so a binary
+            # search over it only works for the first account.
+            cands = ", ".join(
+                f'"{escape_applescript_string(sanitize_input(c))}"'
+                for c in self._mailbox_name_candidates(folder)
+            )
+            mailbox_setup = (
+                f"set accountRef to {applescript_account_clause(account)}\n"
+                "            set mbList to {}\n"
+                f"            repeat with cand in {{{cands}}}\n"
+                "                try\n"
+                "                    set end of mbList to my resolveMailbox("
+                "accountRef, (cand as text))\n"
+                "                    exit repeat\n"
+                "                end try\n"
+                "            end repeat\n"
+                '            if (count of mbList) is 0 then return "MAILBOX_UNRESOLVED"'
+            )
+            mailbox_list = "mbList"
+            handlers = f"{_MAILBOX_RESOLVER_HANDLERS}\n"
+        else:
+            mailbox_setup = ""
+            mailbox_list = "{inbox, sent mailbox}"
+            handlers = ""
+        script = handlers + _wrap_with_timeout(
             f"""tell application "Mail"
             {target_date}
+            {mailbox_setup}
             set loDate to targetDate - (1 * days)
             set hiDate to targetDate + (1 * days)
             set foundId to ""
             set sawOrderProblem to false
 
-            repeat with mb in {{inbox, sent mailbox}}
+            repeat with mb in {mailbox_list}
                 set n to (count of messages of mb)
                 if n > 0 then
                     -- #242: Mail's iteration order has changed before. A
@@ -5261,6 +5322,12 @@ class AppleMailConnector:
         )
 
         result = self._run_applescript(script).strip()
+        if result == "MAILBOX_UNRESOLVED":
+            raise MailAnchorLookupIncompleteError(
+                f"Could not locate Message-ID {rfc5322_message_id!r}: IMAP "
+                f"found it in folder {folder!r} of account {account!r}, but "
+                "Mail has no mailbox by that name in that account."
+            )
         if result == "ORDER_UNEXPECTED":
             raise MailAnchorLookupIncompleteError(
                 f"Could not locate Message-ID {rfc5322_message_id!r}: Mail is "
