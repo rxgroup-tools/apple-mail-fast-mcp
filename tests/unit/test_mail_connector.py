@@ -5950,6 +5950,89 @@ class TestFindMessageByMessageId:
         }
         return c
 
+    # --- rx6: search inside the account IMAP found the message in --------
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_search_runs_inside_the_imap_account_not_unified_inbox(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Mail's unified inbox concatenates per-account lists instead of
+        merging them by date, so a binary search over it only works for the
+        first account. A message on the second account was reported as
+        'could not be checked'. Search the account IMAP located it in."""
+        connector._locate_via_imap = lambda mid: {  # type: ignore[assignment]
+            "folder": "INBOX",
+            "account": "Julian | ZEUZ Fitness",
+            "internaldate": datetime(2026, 11, 20, 9, 30, 0),
+        }
+        mock_run.return_value = "777"
+        assert connector.find_message_by_message_id("<b@example.com>") == "777"
+        script = mock_run.call_args[0][0]
+        assert 'account "Julian | ZEUZ Fitness"' in script
+        assert "on resolveMailbox" in script
+        assert "repeat with mb in mbList" in script
+        assert "{inbox, sent mailbox}" not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_without_account_keeps_unified_probe(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "5"
+        connector.find_message_by_message_id("<a@example.com>")
+        assert "{inbox, sent mailbox}" in mock_run.call_args[0][0]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_unresolved_mailbox_raises_incomplete(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        connector._locate_via_imap = lambda mid: {  # type: ignore[assignment]
+            "folder": "INBOX.Sent",
+            "account": "Julian | RX Group",
+            "internaldate": datetime(2026, 11, 20, 9, 30, 0),
+        }
+        mock_run.return_value = "MAILBOX_UNRESOLVED"
+        with pytest.raises(MailAnchorLookupIncompleteError):
+            connector.find_message_by_message_id("<a@example.com>")
+
+    def test_mailbox_name_candidates(self) -> None:
+        cands = AppleMailConnector._mailbox_name_candidates
+        assert cands("INBOX") == ["INBOX"]
+        assert cands("INBOX.Sent") == ["INBOX.Sent", "Sent", "INBOX/Sent"]
+        assert cands("INBOX.AFWACHTEN.PRIORITEIT 1")[:2] == [
+            "INBOX.AFWACHTEN.PRIORITEIT 1", "AFWACHTEN/PRIORITEIT 1",
+        ]
+        assert cands("[Gmail]/All Mail") == ["[Gmail]/All Mail", "All Mail"]
+
+    def test_locate_via_imap_reports_the_account(
+        self, connector: AppleMailConnector
+    ) -> None:
+        connector = AppleMailConnector(timeout=30)
+        connector.list_accounts = lambda: [  # type: ignore[assignment]
+            {"name": "A"}, {"name": "B"},
+        ]
+        connector._imap_breaker_open = lambda a: False  # type: ignore[assignment]
+        connector._resolve_imap_config = (  # type: ignore[assignment]
+            lambda a: ("h", 993, f"{a}@x")
+        )
+        connector._get_imap_password_with_fallback = (  # type: ignore[assignment]
+            lambda a, e: "pw"
+        )
+        connector._imap_clear_breaker = lambda a: None  # type: ignore[assignment]
+
+        class _Fake:
+            def __init__(self, host, port, email, pw, pool=None):
+                self.email = email
+
+            def locate_message(self, mid):
+                if self.email.startswith("B"):
+                    return {"folder": "INBOX", "uid": 1,
+                            "internaldate": datetime(2026, 11, 20)}
+                return None
+
+        with patch("apple_mail_fast_mcp.mail_connector.ImapConnector", _Fake):
+            found = connector._locate_via_imap("<x@y>")
+        assert found is not None and found["account"] == "B"
+
     # --- #432: no unindexed all-mailbox scan, ever -----------------------
 
     @patch.object(AppleMailConnector, "_run_applescript")
